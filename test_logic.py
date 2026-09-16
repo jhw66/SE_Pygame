@@ -1,6 +1,6 @@
-"""第三天第一批：运行本文件检查路径规则，不启动游戏窗口。"""
+"""运行本文件检查路径规则和箭头数量，不启动游戏窗口。"""
 
-from game_logic import can_exit
+from game_logic import can_exit, count_arrows
 
 
 def run_tests():
@@ -56,6 +56,17 @@ def run_tests():
         print(f"PASS：{name}")
 
     print(f"\n全部 {len(cases)} 个案例通过，每个案例均确认棋盘未被修改。")
+
+    count_cases = [
+        ("空棋盘数量", [], 0),
+        ("全空格数量", [[None, None], [None, None]], 0),
+        ("四方向数量", [["U", "D"], ["L", "R"]], 4),
+        ("箭头与空格混合", [["U", None, "R"], [None, "L", None]], 3),
+    ]
+    for name, board, expected in count_cases:
+        assert count_arrows(board) == expected, name
+        print(f"PASS：{name}")
+    print(f"全部 {len(count_cases)} 个数量统计案例通过。")
 
 
 if __name__ == "__main__":

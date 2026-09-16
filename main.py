@@ -1,5 +1,7 @@
 import pygame
 
+from game_logic import can_exit, count_arrows
+
 pygame.init()
 
 WINDOW_WIDTH=960
@@ -33,6 +35,8 @@ ARROW_COLOR = (100, 225, 190)
 SELECTED_COLOR = (255, 210, 90)
 TEXT_COLOR = (235, 240, 250)
 MUTED_TEXT_COLOR = (170, 180, 200)
+ERROR_COLOR = (255, 120, 120)
+MAX_MISTAKES = 3
 
 DIRECTION_NAMES = {
     "U": "上",
@@ -63,7 +67,7 @@ title_surface = title_font.render("一箭又一箭", True, TEXT_COLOR)
 title_rect = title_surface.get_rect(center=(WINDOW_WIDTH // 2, 50))
 
 hint_surface = info_font.render(
-    "点击棋盘中的箭头进行选择",
+    "无阻挡即可消除，点击受阻箭头消耗 1 次机会",
     True,
     MUTED_TEXT_COLOR,
 )
@@ -156,27 +160,51 @@ clock=pygame.time.Clock()
 
 running=True
 selected_cell = None
+mistakes_remaining = MAX_MISTAKES
+status_text = "点击一个箭头，检查它能否离开棋盘"
 
 while running:
     for event in pygame.event.get():
         if event.type==pygame.QUIT:
             running=False
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # 次数耗尽后只跳过点击处理，窗口仍然绘制并响应关闭事件。
+            if mistakes_remaining <= 0:
+                continue
+
             if board_rect.collidepoint(event.pos):
                 mouse_x, mouse_y = event.pos
                 col = (mouse_x - BOARD_X) // CELL_SIZE
                 row = (mouse_y - BOARD_Y) // CELL_SIZE
 
                 if board[row][col] is not None:
-                    selected_cell = (row, col)
-                    print(
-                        f"选中：行={row}，列={col}，"
-                        f"方向={board[row][col]}"
-                    )
+                    # 在消除前保存方向，用于显示本次操作的结果。
+                    direction_name = DIRECTION_NAMES[board[row][col]]
+                    if can_exit(board, row, col):
+                        board[row][col] = None
+                        selected_cell = None
+                        status_text = (
+                            f"已消除：第 {row + 1} 行，第 {col + 1} 列，"
+                            f"方向：{direction_name}"
+                        )
+                    else:
+                        selected_cell = (row, col)
+                        # 只在本次左键点击确实被阻挡时扣一次。
+                        mistakes_remaining -= 1
+                        if mistakes_remaining == 0:
+                            status_text = "失误次数已耗尽，本关失败"
+                        else:
+                            status_text = (
+                                f"第 {row + 1} 行，第 {col + 1} 列："
+                                "前方有阻挡，失误机会减 1"
+                            )
+                    print(status_text)
                 else:
                     selected_cell = None
+                    status_text = "这里是空格，请点击箭头"
             else:
                 selected_cell = None
+                status_text = "请点击棋盘内的箭头"
     screen.fill(BACKGROUND_COLOR)
     screen.blit(title_surface, title_rect)
     screen.blit(hint_surface, hint_rect)
@@ -184,20 +212,21 @@ while running:
     draw_arrows(screen)
     draw_selection(screen, selected_cell)
 
-    if selected_cell is None:
-        status_text = "当前未选择箭头"
-    else:
-        row, col = selected_cell
-        direction_name = DIRECTION_NAMES[board[row][col]]
-        status_text = (
-            f"已选择：第 {row + 1} 行，第 {col + 1} 列，"
-            f"方向：{direction_name}"
-        )
+    # 直接根据当前棋盘统计，避免单独维护数量时漏减或重复扣减。
+    remaining_arrows = count_arrows(board)
+    count_surface = info_font.render(
+        f"剩余箭头：{remaining_arrows}    剩余失误次数：{mistakes_remaining}",
+        True,
+        TEXT_COLOR,
+    )
+    count_rect = count_surface.get_rect(center=(WINDOW_WIDTH // 2, 565))
+    screen.blit(count_surface, count_rect)
 
     # 状态文字会随选择变化，因此需要在主循环中重新渲染。
-    status_surface = info_font.render(status_text, True, TEXT_COLOR)
+    status_color = ERROR_COLOR if mistakes_remaining == 0 else TEXT_COLOR
+    status_surface = info_font.render(status_text, True, status_color)
     status_rect = status_surface.get_rect(
-        center=(WINDOW_WIDTH // 2, 585)
+        center=(WINDOW_WIDTH // 2, 605)
     )
     screen.blit(status_surface, status_rect)
     pygame.display.flip()

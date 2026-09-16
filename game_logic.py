@@ -47,3 +47,13 @@ def can_exit(board, row, col):
 
     # 已经走出棋盘，说明整条前方路径都没有阻挡。
     return True
+
+
+def count_arrows(board):
+    """统计棋盘中非空格子的数量。"""
+    count = 0
+    for row in board:
+        for direction in row:
+            if direction is not None:
+                count += 1
+    return count
