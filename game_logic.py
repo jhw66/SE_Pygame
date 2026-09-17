@@ -13,7 +13,6 @@ DIRECTIONS = {
 
 def can_exit(board, row, col):
     """返回指定箭头能否飞出棋盘，不修改棋盘。
-
     棋盘的每一行应当等长，格子只能是 None 或 U/D/L/R。
     空棋盘、棋盘外坐标和空格返回 False。
     """
@@ -57,3 +56,24 @@ def count_arrows(board):
             if direction is not None:
                 count += 1
     return count
+
+
+def solve_board(board):
+    """返回合法消除顺序；无解返回 None，空棋盘返回 []，不修改输入。"""
+    working = [row[:] for row in board]
+    solution = []
+    while count_arrows(working) > 0:
+        removable = None
+        for row, line in enumerate(working):
+            for col, direction in enumerate(line):
+                if direction is not None and can_exit(working, row, col):
+                    removable = (row, col)
+                    break
+            if removable is not None:
+                break
+        if removable is None:
+            return None
+        row, col = removable
+        working[row][col] = None
+        solution.append((row, col))
+    return solution

@@ -57,6 +57,7 @@ def run_tests():
 
     print(f"\n全部 {len(cases)} 个案例通过，每个案例均确认棋盘未被修改。")
 
+    
     count_cases = [
         ("空棋盘数量", [], 0),
         ("全空格数量", [[None, None], [None, None]], 0),
