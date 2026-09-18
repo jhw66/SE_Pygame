@@ -57,9 +57,8 @@ def count_arrows(board):
                 count += 1
     return count
 
-
+# 找到正确消除顺序，无解返回 None，空棋盘返回 []，不修改输入
 def solve_board(board):
-    """返回合法消除顺序；无解返回 None，空棋盘返回 []，不修改输入。"""
     working = [row[:] for row in board]
     solution = []
     while count_arrows(working) > 0:

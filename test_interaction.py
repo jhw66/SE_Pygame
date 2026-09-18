@@ -98,7 +98,7 @@ def run_tests():
     blocked = run_game([(blocked_pos, 1)])
     assert blocked["board"] == initial_board
     assert blocked["remaining_arrows"] == 13
-    assert blocked["selected_cell"] == (0, 2)
+    assert blocked["selected_cell"] is None  # 等待动画后，选中框的计时也已结束。
     assert blocked["mistakes_remaining"] == 2
     assert "前方有阻挡" in blocked["status_text"]
     print("PASS：阻挡点击保留棋盘与数量，显示原因")
@@ -398,6 +398,7 @@ def run_tests():
         assert result["mistakes_remaining"] == 3
         assert result["game_state"] == result["PLAYING"]
         assert result["selected_cell"] is None
+        assert result["selected_remaining"] == 0
         assert result["flying_arrow"] is None
         assert result["collision_cell"] is None
         assert result["collision_remaining"] == 0
