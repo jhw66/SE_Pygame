@@ -9,7 +9,7 @@ COLLISION_PAUSE = 0.1
 MAX_MISTAKES = 3
 
 
-# 一次动画的运行数据：预判结果、固定速度、阶段和当前路程。
+# 一次动画的运行数据：预判结果、固定速度、阶段和当前路程
 @dataclass
 class Motion:
     plan: MovementPlan
@@ -23,33 +23,33 @@ class Motion:
         return self.phase in ("pause", "return")
 
 
-# 管理一局游戏的规则状态，时间推进不依赖 Pygame 窗口。
+# 管理一局游戏的规则状态，时间推进不依赖 Pygame 窗口
 class GameSession:
     def __init__(self, board):
         self.load(board)
 
+    # 保存原始布局快照，供重玩同一题使用
     def load(self, board):
-        # 保存原始布局快照，供重玩同一题使用。
         self.initial = board.copy()
         self.restart()
 
+    # 恢复布局和机会，并丢弃旧动画；视图位置由界面层保留
     def restart(self):
-        # 恢复布局和机会，并丢弃旧动画；视图位置由界面层保留。
         self.board = self.initial.copy()
         self.state = PLAYING if self.board.arrows else WON
         self.mistakes_remaining = MAX_MISTAKES
         self.motion = None
         self.status = "点击头部所在格；身体点击无效"
 
+    # 只在可操作且没有动画时接受头部点击，身体与空格直接忽略
     def click(self, cell):
-        # 只在可操作且没有动画时接受头部点击，身体与空格直接忽略。
         if self.state != PLAYING or self.motion is not None:
             return False
         arrow_id = self.board.head_at(cell)
         if arrow_id is None:
             return False
         plan = plan_movement(self.board, arrow_id)
-        # 棋盘越大基础速度越快；长路径另外加速，完整动作不超过一秒。
+        # 棋盘越大基础速度越快；长路径另外加速，完整动作不超过一秒
         scaled_speed = BASE_MOVE_SPEED * max(1.0, max(self.board.rows, self.board.cols) / 5)
         travel_budget = (MAX_ACTION_DURATION if plan.outcome == "exit"
                          else (MAX_ACTION_DURATION - COLLISION_PAUSE) / 2)
@@ -60,17 +60,19 @@ class GameSession:
     def update(self, dt):
         if dt < 0:
             raise ValueError("时间增量不能为负数")
-        # 消耗跨越状态边界的剩余 dt，保证大帧和多个小帧结果一致。
+        # 消耗跨越状态边界的剩余 dt，保证大帧和多个小帧结果一致
         while self.motion is not None and dt > 0:
             motion = self.motion
             if motion.phase == "forward":
-                # 前进到预判终点之前，保持逻辑棋盘和剩余数量不变。
+                # 前进到预判终点之前，保持逻辑棋盘和剩余数量不变
                 needed = (motion.plan.distance - motion.progress) / motion.speed
                 elapsed = min(dt, needed)
                 motion.progress = min(motion.plan.distance, motion.progress + elapsed * motion.speed)
                 dt -= elapsed
+                # 判断是否到达终点，没到达则退出重新循环移动
                 if elapsed + 1e-10 < needed:
                     break
+                # 如果没有执行 break，就视为已经到达终点
                 motion.progress = motion.plan.distance
                 if motion.plan.outcome == "exit":
                     # 完整离场才提交删除；最后一支删除后才通关。

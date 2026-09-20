@@ -116,12 +116,11 @@ class MovementPlan:
     distance: float
     obstacle: Cell | None = None
 
-
+# 只读扫描头部前方，计算完整离场或首次碰撞所需的逻辑距离
 def plan_movement(board, arrow_id):
-    # 只读扫描头部前方，计算完整离场或首次碰撞所需的逻辑距离。
     arrow = board.arrows[arrow_id]
-    dr, dc = DIRECTIONS[arrow.direction]
-    r, c = arrow.head
+    dr, dc = DIRECTIONS[arrow.direction]  # 头部方向
+    r, c = arrow.head                     # 头部位置
     own_indices = {cell: i for i, cell in enumerate(arrow.cells)}
     step = 0
     while True:
@@ -131,30 +130,27 @@ def plan_movement(board, arrow_id):
             # 等尾部到达棋盘外格子的中心，给尾端和线宽保留余量。
             return MovementPlan(arrow_id, "exit", step + len(arrow.cells) - 1 + TAIL_EXTENT)
         occupant = board.occupancy[cell[0]][cell[1]]
-        # 走第 step 步时，原路径下标小于 step 的尾部已经腾空。
-        blocked = occupant is not None and (
-            occupant != arrow_id or own_indices[cell] >= step
+        blocked = occupant is not None and (                   # 其他箭头占用的格子，直接阻挡
+            occupant != arrow_id or own_indices[cell] >= step  # 自己的身体格，检查到达时是否已经腾空
         )
         if blocked:
             # 从障碍格中心退半格，再减尖端长度，保证尖端不穿入障碍。
             return MovementPlan(arrow_id, "collision", step - 0.5 - NOSE_EXTENT, cell)
 
-
+# 求解器与玩家点击复用同一个运动预判入口
 def can_exit(board, arrow_id):
-    # 求解器与玩家点击复用同一个运动预判入口。
     return arrow_id in board.arrows and plan_movement(board, arrow_id).outcome == "exit"
 
 
 def count_arrows(board):
     return len(board.arrows)
 
-
+# 移除只会减少阻挡，因此可逐轮贪心求解；不修改输入
 def solve_board(board, checkpoint=None):
-    """移除只会减少阻挡，因此可逐轮贪心求解；不修改输入。"""
     working = board.copy()
     solution = []
     while working.arrows:
-        # 每轮移除当前可退出的箭头；整轮无进展说明余下部分死锁。
+        # 每轮移除当前可退出的箭头；整轮无进展说明余下部分死锁
         progressed = False
         for arrow_id in list(working.arrows):
             if checkpoint:
@@ -168,8 +164,8 @@ def solve_board(board, checkpoint=None):
     return solution
 
 
+# 折线路径上的浮点行列坐标；两端按首段和尖端方向延伸
 def path_point(arrow, distance):
-    """折线路径上的浮点行列坐标；两端按首段和尖端方向延伸。"""
     cells = arrow.cells
     if distance < 0:
         if len(cells) == 1:
@@ -188,8 +184,8 @@ def path_point(arrow, distance):
     return a[0] + fraction * (b[0] - a[0]), a[1] + fraction * (b[1] - a[1])
 
 
+# 沿路径截取身体；回退减小同一个 progress，形状不会漂移
 def moving_shape(arrow, progress=0.0):
-    """沿路径截取身体；回退减小同一个 progress，形状不会漂移。"""
     start = progress - TAIL_EXTENT
     # 在固定轨迹上滑动一个定长区间，身体便会逐段跟随头部抽出。
     end = len(arrow.cells) - 1 + progress + 0.12

@@ -165,7 +165,7 @@ class GameApp:
         self.cancel_pointer()
 
     def update(self, dt):
-        # 主线程领取结果；旧任务即使晚到，也不能覆盖重开或新题。
+        # 主线程领取结果；旧任务即使晚到，也不能覆盖重开或新题
         while True:
             try:
                 token, board, metrics, error = self.results.get_nowait()

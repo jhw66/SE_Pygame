@@ -28,14 +28,15 @@ MAX_CELL_SIZE = 80
 # 视图只管理像素、缩放和平移，不改变棋盘的逻辑行列坐标。
 class BoardView:
     def __init__(self, rect, rows, cols):
-        self.rect = pygame.Rect(rect)
-        self.rows, self.cols = rows, cols
-        self.arrow_colors = {}
-        self.fit()
+        self.rect = pygame.Rect(rect)       # 棋盘的可视区域
+        self.rows, self.cols = rows, cols   # 逻辑棋盘的行数、列数
+        self.arrow_colors = {}              # 箭头编号到颜色的映射
+        self.fit()                          # cell_size	当前每格显示多少像素，由 fit() 初始化
+                                            # x、y	当前棋盘左上角在屏幕上的位置，由 fit() 初始化
 
     @property
     def fit_size(self):
-        # 全景应铺满可用区域，小棋盘也不受 80 像素上限限制。
+        # 全景应铺满可用区域，取宽度允许值和高度允许值中较小的一个像素每格
         return min(self.rect.width / self.cols, self.rect.height / self.rows)
 
     @property
@@ -64,10 +65,10 @@ class BoardView:
             self.arrow_colors[arrow_id] = bag.pop()
 
     def fit(self):
-        # 根据视口计算完整展示比例，并将棋盘居中。
+        # 根据视口计算完整展示比例，并将棋盘居中
         self.cell_size = self.fit_size
-        self.x = self.rect.centerx - self.cols * self.cell_size / 2
-        self.y = self.rect.centery - self.rows * self.cell_size / 2
+        self.x = self.rect.centerx - self.cols * self.cell_size / 2 # 棋盘左边 = 视口中心横坐标 - 棋盘宽度的一半
+        self.y = self.rect.centery - self.rows * self.cell_size / 2 # 棋盘顶部 = 视口中心纵坐标 - 棋盘高度的一半
 
     def set_board(self, rows, cols):
         self.rows, self.cols = rows, cols
@@ -89,20 +90,32 @@ class BoardView:
         return None
 
     def _clamp(self):
-        # 小于视口时居中，大于视口时限制拖动，防止把整张棋盘拖走。
+        # 小于视口时居中，大于视口时限制拖动，防止把整张棋盘拖走
         width, height = self.cols * self.cell_size, self.rows * self.cell_size
+        # 棋盘左边 ≤ 视口左边；棋盘右边 ≥ 视口右边
+        # 换成对 x 的限制：视口右边 - 棋盘宽度 ≤ x ≤ 视口左边
         self.x = (self.rect.centerx - width / 2 if width <= self.rect.width
                   else min(self.rect.left, max(self.rect.right - width, self.x)))
         self.y = (self.rect.centery - height / 2 if height <= self.rect.height
                   else min(self.rect.top, max(self.rect.bottom - height, self.y)))
 
+
     def zoom(self, pos, steps):
-        # 记录鼠标下的逻辑位置，缩放后调整偏移，让该位置尽量保持不动。
+        # 记录鼠标下的逻辑位置，缩放后调整偏移，让该位置尽量保持不动
         if not self.rect.collidepoint(pos):
             return
         wx = (pos[0] - self.x) / self.cell_size
         wy = (pos[1] - self.y) / self.cell_size
-        self.cell_size = min(self.max_zoom_size, max(self.fit_size, self.cell_size * 1.2 ** max(-20, min(20, steps))))
+        # 最小不能小于全景尺寸，最大不能超过 max_zoom_size。
+        self.cell_size = min(
+            self.max_zoom_size, 
+            max(
+                self.fit_size,
+                self.cell_size * 1.2 ** max(-20, min(20, steps))
+            )
+        )
+
+        # 鼠标屏幕位置 = 棋盘偏移 + 鼠标下的逻辑位置 × 格子大小
         self.x = pos[0] - wx * self.cell_size
         self.y = pos[1] - wy * self.cell_size
         self._clamp()
