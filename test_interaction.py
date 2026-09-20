@@ -1,466 +1,535 @@
-"""用模拟鼠标事件运行实际主循环；使用离屏窗口，不代表人工试玩。
-
-运行方法：.venv/Scripts/python.exe -X utf8 test_interaction.py
-这一测试脚本使用 runpy 和 mock 驱动窗口代码，游戏本身不依赖这些工具。
-"""
-
+"""离屏 Pygame 交互、状态机、实际事件循环和绘制回归测试。"""
 import os
-from contextlib import nullcontext
-from math import isclose
-from pathlib import Path
-import runpy
-from unittest.mock import patch
-
-# 在导入 Pygame 前设置离屏显示和静音，测试无需弹出真实窗口。
+# 用虚拟视频和音频驱动运行真实 Pygame 事件与绘制，不弹出测试窗口。
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 
+from pathlib import Path
+import random
+import threading
+import time
+import unittest
+from unittest.mock import patch
 import pygame
 
+from board_view import BoardView, ARROW_PALETTE, ERROR_COLOR
+from game_logic import Arrow, BoardState, DIRECTIONS, moving_shape, solve_board
+from game_state import COLLISION_PAUSE, FAILED, GameSession, PLAYING, WON
+from levels import GenerationError, LevelConfig, generate_level, load_level
+from main import GameApp, main
 
-# 旧布局作为固定的交互测试夹具：它本身有死锁，不再用作实际游戏题目。
-# 固定它可以持续复查历史点击案例；真实随机生成与完整通关由 test_puzzles.py 检查。
-FIXTURE_BOARD = [
-    ["U", None, "R", None, "D"],
-    [None, "L", None, "D", None],
-    ["R", None, "U", None, "L"],
-    [None, "D", None, "R", None],
-    ["L", None, "U", None, "R"],
-]
+ROOT = Path(__file__).parent
 
 
-def fixed_level(**kwargs):
-    return [row[:] for row in FIXTURE_BOARD]
+def click(pos, button=1):
+    return pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=pos, button=button)
 
 
-def run_game(clicks, idle_frames=0, same_frame=False, settle_frames=90, on_frame=None,
-             level_factory=fixed_level):
-    """默认每次点击后等待动画完成；settle_frames=0 用于测试连点。"""
-    frames = []
-    for pos, button in clicks:
-        frames.append([
-            pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=pos, button=button)
-        ])
-        if not same_frame:
-            frames.extend([[] for _ in range(settle_frames)])
-    if same_frame:
-        events = []
-        for frame in frames:
-            events.extend(frame)
-        frames = [events]
-        frames.extend([[] for _ in range(settle_frames)])
-    for _ in range(idle_frames):
-        frames.append([])
-    frames.append([pygame.event.Event(pygame.QUIT)])
-
-    # 固定每帧为 16 毫秒，让测试快速且不受电脑运行速度影响。
-    with (
-        patch("pygame.event.get", side_effect=frames),
-        patch("pygame.time.Clock") as clock,
-        patch("pygame.display.flip", side_effect=on_frame),
-        patch("levels.generate_level", side_effect=level_factory)
-        if level_factory is not None else nullcontext(),
-    ):
-        clock.return_value.tick.return_value = 16
-        return runpy.run_path(str(Path(__file__).with_name("main.py")))
+def send(app, events):
+    """历史点击场景补齐左键松开事件；拖动测试直接发送原始事件。"""
+    expanded = []
+    for event in events:
+        expanded.append(event)
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            expanded.append(pygame.event.Event(pygame.MOUSEBUTTONUP, pos=event.pos, button=1))
+    app.handle_events(expanded)
 
 
-def run_tests():
-    initial = run_game([])
-    initial_board = initial["board"]
-    assert initial["remaining_arrows"] == 13
-    assert initial["mistakes_remaining"] == 3
+def fixture():
+    return load_level(ROOT / "examples/manual.json")
 
-    def cell_center(row, col):
-        # 读取主程序的布局参数，避免测试里另写一套棋盘像素坐标。
-        size = initial["CELL_SIZE"]
-        return (
-            initial["BOARD_X"] + col * size + size // 2,
-            initial["BOARD_Y"] + row * size + size // 2,
-        )
 
-    # 第 1 行第 1 列朝上且位于边缘，可消除。
-    clear_pos = cell_center(0, 0)
-    blocked_pos = cell_center(0, 2)
-    empty_pos = cell_center(0, 1)
-    expected_removed = [row[:] for row in initial_board]
-    expected_removed[0][0] = None
+class SessionTests(unittest.TestCase):
+    # 直接推进时间，验证一秒上限、扣机会时机、精确回退与重开取消。
+    def test_complete_exit_and_collision_roundtrip_within_one_second(self):
+        speeds = []
+        for size in (4, 8, 16, 25, 50):
+            for blocked in (False, True):
+                arrows = {0: Arrow(0, ((0, 0),), "R")}
+                if blocked:
+                    arrows[1] = Arrow(1, ((0, size - 1),), "U")
+                board = BoardState(size, size, arrows)
+                for increments in ([1.0], [1 / 120] * 120):
+                    game = GameSession(board)
+                    game.click((0, 0))
+                    if not blocked and len(increments) == 1:
+                        speeds.append(game.motion.speed)
+                    for dt in increments:
+                        game.update(dt)
+                    self.assertIsNone(game.motion, (size, blocked))
+                    if blocked:
+                        self.assertEqual(game.board, board)
+                        self.assertEqual(game.mistakes_remaining, 2)
+                    else:
+                        self.assertEqual(game.state, WON)
+                        self.assertFalse(game.board.arrows)
+        self.assertTrue(all(a < b for a, b in zip(speeds, speeds[1:])))
 
-    removed = run_game([(clear_pos, 1)])
-    assert removed["board"] == expected_removed
-    assert removed["remaining_arrows"] == 12
-    assert removed["selected_cell"] is None
-    assert removed["mistakes_remaining"] == 3
-    assert "已消除" in removed["status_text"]
-    print("PASS：成功点击只消除目标箭头，数量减 1，清除选中框")
+    def test_long_bent_body_also_completes_within_one_second(self):
+        cells = tuple((r, c) for r in range(5)
+                      for c in (range(25) if r % 2 == 0 else range(24, -1, -1)))
+        game = GameSession(BoardState(25, 25, {0: Arrow(0, cells, "R")}))
+        game.click(cells[-1])
+        game.update(0.999)
+        self.assertEqual(len(game.board.arrows), 1)
+        self.assertIsNotNone(game.motion)
+        game.update(0.001)
+        self.assertEqual(game.state, WON)
+        self.assertIsNone(game.motion)
 
-    blocked = run_game([(blocked_pos, 1)])
-    assert blocked["board"] == initial_board
-    assert blocked["remaining_arrows"] == 13
-    assert blocked["selected_cell"] is None  # 等待动画后，选中框的计时也已结束。
-    assert blocked["mistakes_remaining"] == 2
-    assert "前方有阻挡" in blocked["status_text"]
-    print("PASS：阻挡点击保留棋盘与数量，显示原因")
+    def test_collision_progress_pause_return_and_charge_once(self):
+        game = GameSession(fixture())
+        before = game.board.copy()
+        self.assertTrue(game.click((2, 3)))
+        distance = game.motion.plan.distance
+        game.update(distance / game.motion.speed / 2)
+        self.assertGreater(game.motion.progress, 0)
+        self.assertEqual(game.mistakes_remaining, 3)
+        self.assertEqual(game.board, before)
+        self.assertFalse(game.click((0, 0)))
+        game.update(distance / game.motion.speed / 2 + 0.01)
+        self.assertEqual(game.motion.phase, "pause")
+        self.assertEqual(game.mistakes_remaining, 2)
+        game.update(COLLISION_PAUSE)
+        self.assertEqual(game.motion.phase, "return")
+        self.assertLess(game.motion.progress, distance)
+        self.assertEqual(game.mistakes_remaining, 2)
+        game.update(5)
+        self.assertIsNone(game.motion)
+        self.assertEqual(game.board, before)
+        self.assertEqual(game.mistakes_remaining, 2)
+        self.assertEqual(moving_shape(game.board.arrows[0]), moving_shape(before.arrows[0]))
 
-    empty = run_game([(empty_pos, 1)])
-    assert empty["board"] == initial_board
-    assert empty["remaining_arrows"] == 13
-    assert empty["selected_cell"] is None
-    assert empty["mistakes_remaining"] == 3
-    print("PASS：空格点击不改变棋盘和数量")
+    def test_third_collision_fails_only_after_return(self):
+        game = GameSession(fixture())
+        for _ in range(2):
+            game.click((2, 3))
+            game.update(10)
+        game.click((2, 3))
+        game.update(game.motion.plan.distance / game.motion.speed + 0.01)
+        self.assertEqual(game.mistakes_remaining, 0)
+        self.assertEqual(game.state, PLAYING)
+        self.assertIsNotNone(game.motion)
+        self.assertFalse(game.click((0, 0)))
+        game.update(10)
+        self.assertEqual(game.state, FAILED)
+        self.assertFalse(game.click((0, 0)))
+        game.update(20)
+        self.assertEqual(game.mistakes_remaining, 0)
+        game.restart()
+        self.assertEqual(game.state, PLAYING)
+        self.assertEqual(game.mistakes_remaining, 3)
 
-    outside_pos = (
-        initial["BOARD_X"] + initial["COLS"] * initial["CELL_SIZE"],
-        initial["BOARD_Y"],
-    )
-    outside = run_game([(blocked_pos, 1), (outside_pos, 1)])
-    assert outside["board"] == initial_board
-    assert outside["remaining_arrows"] == 13
-    assert outside["selected_cell"] is None
-    assert outside["mistakes_remaining"] == 2  # 只有前面的受阻点击扣了一次。
-    print("PASS：点击棋盘右边界外不越界，并清除旧选中框")
+    def test_four_directions_adjacent_distant_straight_and_bent(self):
+        # 将同一个右向夹具旋转四次，覆盖四方向弯曲/直线/单格。
+        def rotate(cell, turns):
+            r, c = cell
+            for _ in range(turns):
+                r, c = c, 6 - r
+            return r, c
+        for cells in (((3, 2),), ((3, 0), (3, 1), (3, 2)),
+                      ((4, 0), (4, 1), (3, 1), (3, 2))):
+            for turns, direction in enumerate(("R", "D", "L", "U")):
+                for col in (3, 5):
+                    a = Arrow(0, tuple(rotate(cell, turns) for cell in cells), direction)
+                    blocker = Arrow(1, (rotate((3, col), turns),), "U")
+                    game = GameSession(BoardState(7, 7, {0: a, 1: blocker}))
+                    before = game.board.copy()
+                    game.click(a.head)
+                    distance = game.motion.plan.distance
+                    self.assertGreater(distance, 0)
+                    game.update(distance / game.motion.speed + 0.001)
+                    self.assertEqual(game.motion.phase, "pause")
+                    self.assertEqual(game.mistakes_remaining, 2)
+                    game.update(10)
+                    self.assertEqual(game.board, before)
+                    game.board.remove(1)
+                    game.click(a.head)
+                    game.update(20)
+                    self.assertEqual(game.state, WON)
+                    self.assertEqual(game.mistakes_remaining, 2)
 
-    repeated = run_game([(clear_pos, 1), (clear_pos, 1)])
-    assert repeated["board"] == expected_removed
-    assert repeated["remaining_arrows"] == 12
-    assert repeated["mistakes_remaining"] == 3
-    assert "空格" in repeated["status_text"]
-    print("PASS：重复点击已消除位置不会重复减数")
+    def test_self_collision_returns(self):
+        cells = ((5, 4), (4, 4), (3, 4), (2, 4), (2, 3), (2, 2), (2, 1), (3, 1), (3, 2))
+        board = BoardState(6, 6, {0: Arrow(0, cells, "R")})
+        game = GameSession(board)
+        game.click((3, 2))
+        game.update(10)
+        self.assertEqual(game.board, board)
+        self.assertEqual(game.mistakes_remaining, 2)
 
-    right_click = run_game([(clear_pos, 3)])
-    assert right_click["board"] == initial_board
-    assert right_click["remaining_arrows"] == 13
-    assert right_click["mistakes_remaining"] == 3
-    print("PASS：鼠标右键不会消除箭头")
+    def test_dt_partition_and_complete_exit_before_win(self):
+        a, b = GameSession(fixture()), GameSession(fixture())
+        a.click((2, 3))
+        b.click((2, 3))
+        a.update(0.45)
+        for _ in range(45):
+            b.update(0.01)
+        self.assertEqual(a.motion.phase, b.motion.phase)
+        self.assertAlmostEqual(a.motion.progress, b.motion.progress)
+        self.assertEqual(a.mistakes_remaining, b.mistakes_remaining)
+        game = GameSession(BoardState(1, 1, {0: Arrow(0, ((0, 0),), "R")}))
+        game.click((0, 0))
+        duration = game.motion.plan.distance / game.motion.speed
+        game.update(duration - 0.01)
+        self.assertEqual(game.state, PLAYING)
+        self.assertEqual(len(game.board.arrows), 1)
+        game.update(0.02)
+        self.assertEqual(game.state, WON)
+        self.assertFalse(game.board.arrows)
 
-    # 初始 (1, 3) 向下，被 (3, 3) 阻挡，而 (3, 3) 可直接向右消除。
-    # 移除阻挡物后，再点击同一个箭头，验证使用更新后的棋盘。
-    unlocked = run_game([
-        (cell_center(1, 3), 1),
-        (cell_center(3, 3), 1),
-        (cell_center(1, 3), 1),
-    ])
-    expected_unlocked = [row[:] for row in initial_board]
-    expected_unlocked[1][3] = None
-    expected_unlocked[3][3] = None
-    assert unlocked["board"] == expected_unlocked
-    assert unlocked["remaining_arrows"] == 11
-    assert unlocked["mistakes_remaining"] == 2
-    print("PASS：移除阻挡物后，原先被阻挡的箭头可以消除")
+    def test_restart_load_cancel_every_phase(self):
+        for phase in ("forward", "pause", "return"):
+            for load in (False, True):
+                game = GameSession(fixture())
+                game.click((2, 3))
+                duration = game.motion.plan.distance / game.motion.speed
+                elapsed = {"forward": duration / 2, "pause": duration + 0.01,
+                           "return": duration * 1.5 + COLLISION_PAUSE}[phase]
+                game.update(elapsed)
+                self.assertEqual(game.motion.phase, phase)
+                if load:
+                    replacement = BoardState(4, 4, {10: Arrow(10, ((0, 0),), "U")})
+                    game.load(replacement)
+                else:
+                    replacement = fixture()
+                    game.restart()
+                game.update(20)
+                self.assertEqual(game.board, replacement)
+                self.assertEqual(game.mistakes_remaining, 3)
+                self.assertIsNone(game.motion)
 
-    still_playing = run_game([(blocked_pos, 1)] * 2 + [(clear_pos, 1)])
-    assert still_playing["mistakes_remaining"] == 1
-    assert still_playing["board"] == expected_removed
-    assert still_playing["remaining_arrows"] == 12
-    print("PASS：两次失误后仍可消除安全箭头，成功点击不扣机会")
 
-    failed = run_game([(blocked_pos, 1)] * 3)
-    assert failed["mistakes_remaining"] == 0
-    assert failed["board"] == initial_board
-    assert failed["remaining_arrows"] == 13
-    assert "失败" in failed["status_text"]
-    assert failed["status_color"] == failed["ERROR_COLOR"]
-    assert failed["running"] is False  # 失败后仍能处理关闭事件。
-    print("PASS：第三次失误耗尽机会，保留棋盘并显示失败，可关闭窗口")
+class InteractionTests(unittest.TestCase):
+    # 通过实际事件和画面像素验证点击、拖动、配色、布局与异步任务隔离。
+    def setUp(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((960, 640))
+        self.apps = []
 
-    frozen = run_game(
-        [(blocked_pos, 1)] * 5
-        + [(clear_pos, 1), (empty_pos, 1), (outside_pos, 1), (clear_pos, 3)]
-    )
-    assert frozen["mistakes_remaining"] == 0
-    assert frozen["board"] == initial_board
-    assert frozen["remaining_arrows"] == 13
-    assert frozen["status_text"] == failed["status_text"]
-    assert frozen["selected_cell"] == failed["selected_cell"]
-    print("PASS：失败后的各种点击不会改棋盘、覆盖失败提示或扣成负数")
+    def tearDown(self):
+        for app in self.apps:
+            app.close()
+            if app.worker is not None:
+                app.worker.join(timeout=1)
+        pygame.quit()
 
-    queued = run_game(
-        [(blocked_pos, 1)] * 3 + [(clear_pos, 1)], same_frame=True
-    )
-    assert queued["mistakes_remaining"] == 0
-    assert queued["board"] == initial_board
-    assert "失败" in queued["status_text"]
-    print("PASS：同一帧内耗尽机会后，后续排队点击也无法消除箭头")
+    def app(self, **kwargs):
+        app = GameApp(self.screen, **kwargs)
+        self.apps.append(app)
+        return app
 
-    held = run_game([(blocked_pos, 1)], idle_frames=10)
-    assert held["mistakes_remaining"] == 2
-    assert held["board"] == initial_board
-    print("PASS：一次按下后等待多个绘制帧，不会每帧重复扣机会")
-    print("全部 12 个点击交互场景通过（离屏模拟）。")
+    def test_left_drag_moves_both_ways_without_accidental_arrow_click(self):
+        board = BoardState(25, 25, {0: Arrow(0, ((12, 12),), "R")})
+        app = self.app(board=board)
+        app.view.zoom(app.view.rect.center, 4)
+        for dx in (80, -110):
+            start = app.view.to_screen((12, 12))
+            end = start[0] + dx, start[1]
+            before_x = app.view.x
+            app.handle_events([click(start)])
+            self.assertIsNone(app.session.motion)
+            app.handle_events([
+                pygame.event.Event(pygame.MOUSEMOTION, pos=end, rel=(dx, 0)),
+                pygame.event.Event(pygame.MOUSEBUTTONUP, pos=end, button=1),
+            ])
+            self.assertAlmostEqual(app.view.x, before_x + dx)
+            self.assertIsNone(app.session.motion)
+            self.assertEqual(app.session.mistakes_remaining, 3)
+        head = app.view.to_screen((12, 12))
+        app.handle_events([click(head)])
+        self.assertIsNone(app.session.motion)
+        app.handle_events([pygame.event.Event(pygame.MOUSEBUTTONUP, pos=head, button=1)])
+        self.assertIsNotNone(app.session.motion)
 
-    # 动画刚开始时应移动显示位置，但不能立刻清空棋盘或减少数量。
-    moving = run_game([(clear_pos, 1)], idle_frames=1, settle_frames=0)
-    assert moving["board"] == initial_board
-    assert moving["remaining_arrows"] == 13
-    assert moving["flying_arrow"]["direction"] == "U"
-    assert isclose(moving["flying_arrow"]["x"], clear_pos[0])
-    assert isclose(moving["flying_arrow"]["y"], clear_pos[1] - 320 * 0.032)
-    assert "正在飞出" in moving["status_text"]
-    assert moving["running"] is False
-    print("PASS：空帧仍推进动画，飞出中保留数据与数量，并可响应关闭")
+    def test_horizontal_wheel_shift_wheel_keys_and_pan_limits(self):
+        app = self.app(board=BoardState(25, 25, {0: Arrow(0, ((12, 12),), "U")}))
+        center = app.view.rect.center
+        app.view.zoom(center, 4)
+        scale = app.view.cell_size
+        for event in (
+            pygame.event.Event(pygame.MOUSEWHEEL, x=1, y=0, pos=center),
+            pygame.event.Event(pygame.MOUSEWHEEL, x=0, y=-1, mod=pygame.KMOD_SHIFT, pos=center),
+            pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RIGHT),
+        ):
+            before = app.view.x
+            app.handle_events([event])
+            self.assertLess(app.view.x, before)
+            self.assertEqual(app.view.cell_size, scale)
+        before = app.view.x
+        app.handle_events([pygame.event.Event(pygame.KEYDOWN, key=pygame.K_LEFT)])
+        self.assertGreater(app.view.x, before)
+        app.view.pan(1e6, 1e6)
+        self.assertAlmostEqual(app.view.x, app.view.rect.left)
+        app.view.pan(-1e6, -1e6)
+        self.assertAlmostEqual(app.view.x + app.view.cols * scale, app.view.rect.right)
+        before = app.view.x
+        app.handle_events([pygame.event.Event(pygame.MOUSEWHEEL, x=-2, y=0, pos=(0, 0))])
+        self.assertEqual(app.view.x, before)
 
-    # 包含同一帧多个点击和后续帧点击；整个动画中都只接受第一个。
-    for same_frame in (False, True):
-        busy = run_game(
-            [(clear_pos, 1), (blocked_pos, 1), (cell_center(4, 4), 1)],
-            same_frame=same_frame, settle_frames=0,
-        )
-        assert busy["mistakes_remaining"] == 3
-        assert busy["board"] == initial_board
-        assert (busy["flying_arrow"]["row"], busy["flying_arrow"]["col"]) == (0, 0)
-    print("PASS：动画期间同帧及跨帧连点不会扣机会或启动第二个箭头")
+    def test_pending_click_cancels_on_restart_focus_loss_or_view_change(self):
+        app = self.app(board=fixture())
+        for action in (lambda: app.restart(),
+                       lambda: app.handle_events([pygame.event.Event(pygame.WINDOWFOCUSLOST)]),
+                       lambda: app.handle_events([pygame.event.Event(pygame.MOUSEWHEEL, y=1, pos=app.view.rect.center)])):
+            pos = app.view.to_screen((2, 3))
+            app.handle_events([click(pos)])
+            action()
+            app.handle_events([pygame.event.Event(pygame.MOUSEBUTTONUP, pos=pos, button=1)])
+            self.assertIsNone(app.session.motion)
+            self.assertEqual(app.session.mistakes_remaining, 3)
 
-    for row, col, direction in ((0, 0, "U"), (3, 1, "D"), (4, 0, "L"), (4, 4, "R")):
-        finished = run_game([(cell_center(row, col), 1)])
-        expected = [line[:] for line in initial_board]
-        expected[row][col] = None
-        assert finished["board"] == expected, direction
-        assert finished["flying_arrow"] is None, direction
-        assert finished["remaining_arrows"] == 12, direction
-        assert finished["mistakes_remaining"] == 3, direction
-    print("PASS：四方向动画均完成，并且只清空对应格子一次")
+    def test_ten_random_colors_are_visible_stable_and_restored_on_restart(self):
+        board = BoardState(4, 5, {i: Arrow(i, (divmod(i, 5),), "U") for i in range(20)})
+        app = self.app(board=board, seed=42)
+        colors = app.view.arrow_colors.copy()
+        self.assertEqual(len(set(ARROW_PALETTE)), 10)
+        self.assertNotIn(ERROR_COLOR, ARROW_PALETTE)
+        self.assertEqual(set(colors.values()), set(ARROW_PALETTE))
+        app.draw()
+        for arrow_id, arrow in board.arrows.items():
+            x, y = app.view.to_screen(arrow.head)
+            self.assertEqual(tuple(self.screen.get_at((round(x), round(y)))[:3]), colors[arrow_id])
+        pixels = pygame.image.tobytes(self.screen.subsurface(app.view.rect), "RGB")
+        app.draw()
+        self.assertEqual(pygame.image.tobytes(self.screen.subsurface(app.view.rect), "RGB"), pixels)
+        send(app, [click(app.view.to_screen((0, 0)))])
+        app.update(1)
+        app.restart()
+        app.draw()
+        self.assertEqual(app.view.arrow_colors, colors)
+        self.assertEqual(pygame.image.tobytes(self.screen.subsurface(app.view.rect), "RGB"), pixels)
+        app.install(board)
+        self.assertNotEqual(app.view.arrow_colors, colors)
 
-    # 同一总时长，不同帧数应该有相同位移；独立验证行列与像素轴没有混淆。
-    update = initial["update_flying_arrow"]
-    for direction, dx, dy in (("U", 0, -32), ("D", 0, 32), ("L", -32, 0), ("R", 32, 0)):
-        one_step = {"direction": direction, "x": 480.0, "y": 340.0}
-        ten_steps = one_step.copy()
-        assert update(one_step, 0.1) is False
-        for _ in range(10):
-            assert update(ten_steps, 0.01) is False
-        assert isclose(one_step["x"], 480 + dx)
-        assert isclose(one_step["y"], 340 + dy)
-        assert isclose(one_step["x"], ten_steps["x"])
-        assert isclose(one_step["y"], ten_steps["y"])
-    print("PASS：四方向在不同帧数下，相同时间产生相同位移")
+    def test_head_cell_blank_and_body_clicks(self):
+        for offset in ((0.05, 0.05), (0.5, 0.5), (0.95, 0.95)):
+            app = self.app(board=fixture())
+            r, c = (2, 3)
+            pos = app.view.x + (c + offset[0]) * app.view.cell_size, app.view.y + (r + offset[1]) * app.view.cell_size
+            send(app, [click(pos)])
+            self.assertIsNotNone(app.session.motion)
+            self.assertEqual(app.session.motion.plan.arrow_id, 0)
+        app = self.app(board=fixture())
+        for cell in ((3, 1), (3, 2), (2, 2), (2, 5), (6, 2), (0, 7)):
+            before = app.session.status
+            send(app, [click(app.view.to_screen(cell))])
+            self.assertIsNone(app.session.motion)
+            self.assertEqual(app.session.status, before)
+            self.assertEqual(app.session.mistakes_remaining, 3)
+        send(app, [click(app.view.to_screen((0, 0)), 3), click((0, 0))])
+        self.assertIsNone(app.session.motion)
 
-    # 中心刚到边缘时，尾部还在棋盘里，不能提前结束。
-    for direction, x, y in (("U", 480, 140), ("D", 480, 540), ("L", 280, 340), ("R", 680, 340)):
-        arrow = {"direction": direction, "x": x, "y": y}
-        assert update(arrow, 0) is False
-        assert update(arrow, 0.1) is True  # 再移动 32 像素，尾部也已离开。
-    print("PASS：四边界均等待整支箭头离开，不在中心越界时提前删除")
-    print("新增 5 组飞出动画检查通过（离屏模拟）。")
+    def test_zoom_pan_hit_mapping_and_overview(self):
+        # 沉浸布局下 25×25 已足够直接点击；用更大棋盘验证概览保护。
+        board = BoardState(40, 40, {0: Arrow(0, ((20, 18), (20, 19), (20, 20)), "R")})
+        app = self.app(board=board)
+        self.assertFalse(app.view.can_click)
+        send(app, [click(app.view.to_screen((20, 20)))])
+        self.assertIsNone(app.session.motion)
+        anchor = app.view.rect.center
+        send(app, [pygame.event.Event(pygame.MOUSEWHEEL, y=5, pos=anchor)])
+        self.assertTrue(app.view.can_click)
+        send(app, [click(anchor, 2), pygame.event.Event(pygame.MOUSEMOTION, rel=(30, -25)),
+                           pygame.event.Event(pygame.MOUSEBUTTONUP, button=2, pos=anchor)])
+        self.assertEqual(app.view.cell_at(app.view.to_screen((20, 20))), (20, 20))
+        send(app, [click(app.view.to_screen((20, 19)))])
+        self.assertIsNone(app.session.motion)
+        send(app, [click(app.view.to_screen((20, 20)))])
+        self.assertIsNotNone(app.session.motion)
+        progress = app.session.motion.progress
+        send(app, [pygame.event.Event(pygame.MOUSEWHEEL, y=1, pos=anchor)])
+        app.draw()
+        self.assertEqual(app.session.motion.progress, progress)
+        saved = (app.view.x, app.view.y, app.view.cell_size)
+        send(app, [click(app.buttons["restart"].center)])
+        self.assertEqual((app.view.x, app.view.y, app.view.cell_size), saved)
+        send(app, [click(app.buttons["fit"].center)])
+        self.assertFalse(app.view.can_click)
+        self.assertIsNone(app.view.cell_at((app.view.rect.right, app.view.rect.centery)))
 
-    # 从真实绘制的画布读取颜色，确认不只是变量变了，箭杆与箭头也真的变红。
-    other_blocked_pos = cell_center(0, 4)
-    normal_color = initial["ARROW_COLOR"]
-    red_color = initial["ERROR_COLOR"]
+    def test_click_and_restart_queued_events(self):
+        app = self.app(board=fixture())
+        send(app, [click(app.view.to_screen((2, 3))), click(app.view.to_screen((0, 0)))])
+        self.assertEqual(app.session.motion.plan.arrow_id, 0)
+        app.update(0.4)
+        send(app, [click(app.buttons["restart"].center), click(app.view.to_screen((2, 3)))])
+        app.update(10)
+        self.assertEqual(app.session.board, fixture())
+        self.assertEqual(app.session.mistakes_remaining, 3)
+        self.assertIsNone(app.session.motion)
 
-    def capture_collision(clicks, **options):
-        samples = []
+    def test_actual_pixels_collision_and_return(self):
+        app = self.app(board=fixture())
+        app.draw()
+        original = pygame.image.tobytes(self.screen.subsurface(app.view.rect), "RGB")
+        send(app, [click(app.view.to_screen((2, 3)))])
+        distance = app.session.motion.plan.distance
+        app.update(distance / app.session.motion.speed + 0.001)
+        app.draw()
+        path, _ = moving_shape(app.session.board.arrows[0], distance)
+        x, y = app.view.to_screen(path[0])
+        # 首点处可能受整数端点取整影响，检查其附近是否真正绘出红色。
+        self.assertTrue(any(tuple(self.screen.get_at((round(x) + dx, round(y) + dy))[:3]) == ERROR_COLOR
+                            for dx in range(-2, 3) for dy in range(-2, 3)))
+        app.update(10)
+        app.draw()
+        restored = pygame.image.tobytes(self.screen.subsurface(app.view.rect), "RGB")
+        self.assertEqual(original, restored)
+        self.assertEqual(self.screen.get_clip(), self.screen.get_rect())
 
-        def capture():
-            surface = pygame.display.get_surface()
-            samples.append({
-                "shaft": tuple(surface.get_at(blocked_pos)[:3]),
-                "tip": tuple(surface.get_at((blocked_pos[0] + 14, blocked_pos[1]))[:3]),
-                "other": tuple(surface.get_at(other_blocked_pos)[:3]),
-                "safe": tuple(surface.get_at(clear_pos)[:3]),
-            })
+    def test_whole_game_win_restart_and_manual_new_disabled(self):
+        app = self.app(board=fixture())
+        original = app.session.initial.copy()
+        for arrow_id in solve_board(original):
+            send(app, [click(app.view.to_screen(app.session.board.arrows[arrow_id].head))])
+            app.update(50)
+        app.draw()
+        self.assertEqual(app.session.state, WON)
+        self.assertEqual(app.session.mistakes_remaining, 3)
+        send(app, [click(app.buttons["new"].center)])
+        self.assertFalse(app.generating)
+        self.assertEqual(app.session.state, WON)
+        send(app, [click(app.buttons["restart"].center)])
+        self.assertEqual(app.session.board, original)
 
-        result = run_game(clicks, on_frame=capture, **options)
-        return result, samples
+    def wait_job(self, app):
+        deadline = time.monotonic() + 3
+        while app.generating and time.monotonic() < deadline:
+            app.update(0)
+            time.sleep(0.001)
+        self.assertFalse(app.generating, "生成线程未按时完成")
 
-    red, samples = capture_collision([(blocked_pos, 1)], settle_frames=0)
-    assert samples[0]["shaft"] == samples[0]["tip"] == red_color
-    assert samples[0]["other"] == samples[0]["safe"] == normal_color
-    assert red["collision_cell"] == (0, 2)
-    assert red["board"] == initial_board
-    assert red["remaining_arrows"] == 13
-    assert red["mistakes_remaining"] == 2
-    assert red["running"] is False
-    print("PASS：受阻箭杆和箭头立即变红，其他箭头原色，保留棋盘并可关闭")
+    def test_generation_failure_success_and_stale_result(self):
+        def fail(*args, **kwargs):
+            raise GenerationError("测试预算耗尽")
+        app = self.app(config=LevelConfig(7, 8, 5), board=fixture(), level_factory=fail)
+        before = app.session.board.copy()
+        app.request_new()
+        self.wait_job(app)
+        self.assertEqual(app.session.board, before)
+        self.assertIn("失败", app.notice)
+        app.level_factory = generate_level
+        app.request_new()
+        self.wait_job(app)
+        self.assertNotEqual(app.session.board.signature(), before.signature())
+        expected = app.session.initial.copy()
+        app.session.click(next(iter(expected.arrows.values())).head)
+        app.restart()
+        self.assertEqual(app.session.board, expected)
+        # 旧任务即使不遵守取消信号，结果也不能覆盖重开后的棋盘。
+        release = threading.Event()
+        def delayed(*args, **kwargs):
+            release.wait(1)
+            return fixture()
+        app.level_factory = delayed
+        app.request_new()
+        worker = app.worker
+        app.restart()
+        release.set()
+        worker.join(1)
+        app.update(20)
+        self.assertEqual(app.session.board, expected)
 
-    restored, samples = capture_collision([(blocked_pos, 1)], settle_frames=0, idle_frames=20)
-    assert samples[15]["shaft"] == samples[15]["tip"] == red_color  # 0.240 秒
-    assert samples[16]["shaft"] == samples[16]["tip"] == normal_color  # 0.256 秒
-    assert restored["collision_cell"] is None
-    assert restored["collision_remaining"] == 0
-    assert restored["board"] == initial_board
-    assert restored["mistakes_remaining"] == 2
-    print("PASS：没有新事件时仍计时，约 0.25 秒后恢复，等待不会重复扣次数")
+    def test_responsive_generation_and_quit_during_motion(self):
+        release = threading.Event()
+        def delayed(*args, **kwargs):
+            release.wait(1)
+            return fixture()
+        app = self.app(config=LevelConfig(), board=fixture(), level_factory=delayed)
+        app.request_new()
+        send(app, [pygame.event.Event(pygame.MOUSEWHEEL, y=1, pos=app.view.rect.center)])
+        app.draw()
+        send(app, [pygame.event.Event(pygame.QUIT)])
+        self.assertFalse(app.running)
+        self.assertTrue(app.cancel_event.is_set())
+        release.set()
+        app.worker.join(1)
+        moving = self.app(board=fixture())
+        moving.session.click((2, 3))
+        send(moving, [pygame.event.Event(pygame.QUIT)])
+        self.assertFalse(moving.running)
 
-    renewed, samples = capture_collision([(blocked_pos, 1)] * 2, settle_frames=8, idle_frames=20)
-    assert samples[16]["shaft"] == red_color  # 第二次点击在第 9 帧，重置倒计时。
-    assert samples[25]["shaft"] == normal_color
-    assert renewed["mistakes_remaining"] == 1
-    assert renewed["collision_cell"] is None
-    assert renewed["board"] == initial_board
-    print("PASS：再次受阻重新计时，两次有效点击扣两次，计时不累计延长")
+    def test_real_main_loop_closes(self):
+        with patch("pygame.event.get", side_effect=[[], [pygame.event.Event(pygame.QUIT)]]):
+            main(["--level", str(ROOT / "examples/manual.json")])
 
-    changed, samples = capture_collision(
-        [(blocked_pos, 1), (other_blocked_pos, 1)], settle_frames=0, idle_frames=20,
-    )
-    assert samples[0]["shaft"] == red_color
-    assert samples[1]["shaft"] == normal_color
-    assert samples[1]["other"] == red_color
-    assert samples[-1]["other"] == normal_color
-    assert changed["mistakes_remaining"] == 1
-    assert changed["board"] == initial_board
-    print("PASS：切换到另一个受阻箭头时只标记最新碰撞，不残留旧红色")
+    def test_generated_games_complete_through_head_clicks(self):
+        config = LevelConfig(8, 8, 18, 1, 5, 0.4)
+        for seed in (18, 29, 53):
+            board = generate_level(config, rng=random.Random(seed))
+            app = self.app(config=config, board=board)
+            for arrow_id in solve_board(board):
+                before = len(app.session.board.arrows)
+                head = app.session.board.arrows[arrow_id].head
+                send(app, [click(app.view.to_screen(head))])
+                self.assertIsNotNone(app.session.motion)
+                self.assertEqual(len(app.session.board.arrows), before)
+                app.update(100)
+                self.assertEqual(len(app.session.board.arrows), before - 1)
+            self.assertEqual(app.session.state, WON)
+            self.assertEqual(app.session.mistakes_remaining, 3)
 
-    final_hit, samples = capture_collision(
-        [(blocked_pos, 1)] * 3 + [(clear_pos, 1)],
-        same_frame=True, settle_frames=0, idle_frames=20,
-    )
-    assert samples[0]["shaft"] == red_color
-    assert samples[-1]["shaft"] == normal_color
-    assert final_hit["mistakes_remaining"] == 0
-    assert final_hit["board"] == initial_board
-    assert "失败" in final_hit["status_text"]
-    assert final_hit["collision_cell"] is None
-    assert final_hit["status_color"] == red_color
-    print("PASS：最后一次失误也有红色反馈，到时恢复且保留失败文字和操作限制")
+    def test_resize_and_nonpreset_dimensions(self):
+        for rows, cols in ((4, 4), (7, 10), (16, 16), (25, 25), (27, 31)):
+            head = rows // 2, cols // 2
+            board = BoardState(rows, cols, {0: Arrow(0, (head,), "U")})
+            app = self.app(board=board)
+            send(app, [pygame.event.Event(pygame.VIDEORESIZE, w=800, h=600)])
+            app.view.zoom(app.view.to_screen(head), 10)
+            self.assertEqual(app.view.cell_at(app.view.to_screen(head)), head)
+            send(app, [click(app.view.to_screen(head))])
+            self.assertIsNotNone(app.session.motion)
+            app.draw()
 
-    concurrent, samples = capture_collision(
-        [(blocked_pos, 1), (cell_center(3, 3), 1)], settle_frames=0, idle_frames=100,
-    )
-    expected = [line[:] for line in initial_board]
-    expected[3][3] = None
-    assert samples[1]["shaft"] == red_color
-    assert samples[16]["shaft"] == normal_color
-    assert concurrent["board"] == expected
-    assert concurrent["mistakes_remaining"] == 2
-    assert concurrent["collision_cell"] is None
-    assert concurrent["flying_arrow"] is None
-    print("PASS：碰撞反馈不阻止下一次安全点击，变色计时与飞出动画独立完成")
+    def test_seeded_async_puzzle_sequence(self):
+        config = LevelConfig(4, 4, 6, 1, 4, 0.5)
+        a = self.app(config=config, seed=42)
+        b = self.app(config=config, seed=42)
+        self.wait_job(a)
+        self.wait_job(b)
+        first = a.session.initial.signature()
+        self.assertEqual(first, b.session.initial.signature())
+        for app in (a, b):
+            app.request_new()
+            self.wait_job(app)
+        self.assertEqual(a.session.initial.signature(), b.session.initial.signature())
+        self.assertNotEqual(first, a.session.initial.signature())
 
-    for pos, button in ((empty_pos, 1), (outside_pos, 1), (blocked_pos, 3)):
-        ignored, samples = capture_collision([(pos, button)], settle_frames=0)
-        assert ignored["collision_cell"] is None
-        assert ignored["collision_remaining"] == 0
-        assert ignored["mistakes_remaining"] == 3
-        assert samples[0]["shaft"] == normal_color
-    print("PASS：空格、棋盘外和右键点击不会触发碰撞变色")
-    print("新增 7 组碰撞反馈检查通过（离屏模拟，含像素颜色检查）。")
+    def test_immersive_layout_centers_board_without_controls_covering_cells(self):
+        for size in ((800, 600), (960, 640), (1920, 1080), (960, 960), (800, 1200)):
+            self.screen = pygame.display.set_mode(size)
+            for rows, cols in ((4, 4), (25, 25), (7, 10), (4, 25), (25, 4)):
+                with self.subTest(size=size, board=(rows, cols)):
+                    head = rows // 2, cols // 2
+                    app = self.app(board=BoardState(rows, cols, {0: Arrow(0, (head,), "U")}))
+                    self.assertEqual(app.view.rect.center, self.screen.get_rect().center)
+                    controls = [*app.buttons.values(), app.summary_rect, app.status_rect, app.help_rect]
+                    for rect in controls:
+                        self.assertFalse(rect.colliderect(app.view.rect))
+                        self.assertTrue(self.screen.get_rect().contains(rect))
+                    app.view.zoom(app.view.rect.center, 5)
+                    app.view.pan(200, -200)
+                    app.draw()
+                    app.view.fit()
+                    self.assertEqual(app.view.cell_at(app.view.to_screen(head)), head)
 
-    # 游戏状态与窗口是否运行分开：退出窗口后仍能查看最终游戏阶段。
-    for result in (initial, removed, blocked, still_playing, restored, concurrent):
-        assert result["game_state"] == result["PLAYING"]
-    assert still_playing["mistakes_remaining"] == 1
-    print("PASS：启动、成功消除和前两次失误都保持游戏中状态")
-
-    for result in (failed, frozen, queued, final_hit):
-        assert result["game_state"] == result["FAILED"]
-        assert result["mistakes_remaining"] == 0
-        assert result["flying_arrow"] is None
-        assert result["board"] == initial_board
-    print("PASS：第三次失误进入失败，同帧和后续点击均不能启动飞出或继续扣次数")
-
-    # 先消除再失败：保留失败时的局面，不自动重开，也不接受失败后的安全点击。
-    partial_failure = run_game(
-        [(clear_pos, 1)] + [(blocked_pos, 1)] * 3 + [(cell_center(3, 3), 1)],
-    )
-    assert partial_failure["game_state"] == partial_failure["FAILED"]
-    assert partial_failure["board"] == expected_removed
-    assert partial_failure["remaining_arrows"] == 12
-    assert partial_failure["mistakes_remaining"] == 0
-    assert partial_failure["flying_arrow"] is None
-    assert "失败" in partial_failure["status_text"]
-    print("PASS：已有消除进度在失败后保留，不自动恢复或被后续安全点击修改")
-
-    header_red = []
-    header_rect = initial["failed_title_rect"]
-
-    def capture_failure_header():
-        surface = pygame.display.get_surface()
-        # 标题区域应在第三次失误后实际绘出红字，前两次仍显示普通标题。
-        header_red.append(any(
-            tuple(surface.get_at((x, y))[:3]) == red_color
-            for y in range(header_rect.top, header_rect.bottom, 2)
-            for x in range(header_rect.left, header_rect.right, 2)
-        ))
-
-    visible_failure = run_game(
-        [(blocked_pos, 1)] * 3, settle_frames=0, idle_frames=20,
-        on_frame=capture_failure_header,
-    )
-    assert header_red[:2] == [False, False]
-    assert len(header_red) == 24  # 三次点击、二十个空帧以及最后的关闭帧都已处理。
-    assert all(header_red[2:])
-    assert visible_failure["game_state"] == visible_failure["FAILED"]
-    assert visible_failure["running"] is False
-    assert visible_failure["collision_cell"] is None
-    assert "失败" in visible_failure["status_text"]
-    print("PASS：第三次失误切换红色结果标题，失败后持续绘制、反馈恢复并正常关闭")
-    print("新增 4 组游戏状态检查通过（离屏模拟，含失败标题像素检查）。")
-
-    restart_pos = initial["restart_rect"].center
-
-    def assert_reset(result):
-        assert result["board"] == initial_board
-        assert result["INITIAL_BOARD"] == initial_board
-        assert result["board"] is not result["INITIAL_BOARD"]
-        assert all(a is not b for a, b in zip(result["board"], result["INITIAL_BOARD"]))
-        assert result["remaining_arrows"] == 13
-        assert result["mistakes_remaining"] == 3
-        assert result["game_state"] == result["PLAYING"]
-        assert result["selected_cell"] is None
-        assert result["selected_remaining"] == 0
-        assert result["flying_arrow"] is None
-        assert result["collision_cell"] is None
-        assert result["collision_remaining"] == 0
-        assert result["status_text"] == initial["status_text"]
-        assert result["status_color"] == result["TEXT_COLOR"]
-
-    # 真正消除后再恢复，既检查复制内容，也检查各行没有共享可变列表。
-    assert removed["INITIAL_BOARD"] == initial_board
-    restarted = run_game([(clear_pos, 1), (blocked_pos, 1), (restart_pos, 1)])
-    assert_reset(restarted)
-    print("PASS：消除并失误后重开，恢复完整布局和次数，初始棋盘没有被修改")
-
-    retry = run_game([(blocked_pos, 1)] * 3 + [(restart_pos, 1)])
-    assert_reset(retry)
-    playable = run_game([(blocked_pos, 1)] * 3 + [(restart_pos, 1), (clear_pos, 1)])
-    assert playable["game_state"] == playable["PLAYING"]
-    assert playable["board"] == expected_removed
-    assert playable["mistakes_remaining"] == 3
-    assert "已消除" in playable["status_text"]
-    print("PASS：失败后按钮仍可重开，重开后下一帧起可以正常消除")
-
-    for clicks in (
-        [(cell_center(3, 3), 1), (restart_pos, 1)],
-        [(blocked_pos, 1), (cell_center(3, 3), 1), (restart_pos, 1)],
-    ):
-        cancelled = run_game(clicks, settle_frames=0, idle_frames=100)
-        assert_reset(cancelled)
-    print("PASS：飞出中或飞出与变红并存时重开，等待后也没有旧动画误删新棋盘")
-
-    cleared, samples = capture_collision(
-        [(blocked_pos, 1), (restart_pos, 1)], settle_frames=0,
-    )
-    assert samples[0]["shaft"] == red_color
-    assert samples[1]["shaft"] == normal_color
-    assert_reset(cleared)
-    print("PASS：碰撞变红期间重开，当帧恢复原色并清空选中框、计时和旧提示")
-
-    cycles = [(clear_pos, 1), (blocked_pos, 1), (restart_pos, 1)] * 3
-    assert_reset(run_game(cycles))
-    assert_reset(run_game([(restart_pos, 1)] * 3, same_frame=True))
-    print("PASS：连续三轮游玩重开与同帧连点重开都恢复一致的初始状态")
-
-    # 右键、矩形的右边界与下边界不属于有效重开点击。
-    for pos, button in (
-        (restart_pos, 3),
-        ((initial["restart_rect"].right, restart_pos[1]), 1),
-        ((restart_pos[0], initial["restart_rect"].bottom), 1),
-    ):
-        not_restarted = run_game([(blocked_pos, 1)] * 3 + [(pos, button)])
-        assert not_restarted["game_state"] == not_restarted["FAILED"]
-        assert not_restarted["mistakes_remaining"] == 0
-        assert not_restarted["board"] == initial_board
-    print("PASS：右键及按钮边界外点击不能误触发重开")
-
-    queued_restart = run_game(
-        [(blocked_pos, 1)] * 3 + [(restart_pos, 1), (clear_pos, 1), (blocked_pos, 1)],
-        same_frame=True,
-    )
-    assert_reset(queued_restart)
-    print("PASS：重开当帧排队的后续棋盘点击被丢弃，窗口仍可正常处理关闭")
-    print("新增 7 组重开检查通过（离屏模拟，含棋盘副本及颜色检查）。")
+    def test_small_board_fills_window_height_and_zoom_can_return_to_fit(self):
+        board = BoardState(4, 4, {0: Arrow(0, ((2, 2),), "U")})
+        app = self.app(board=board)
+        self.assertEqual(app.hud_mode, "sides")
+        self.assertEqual(app.view.rect.height, self.screen.get_height() - 16)
+        self.assertAlmostEqual(app.view.rows * app.view.cell_size, app.view.rect.height)
+        self.assertGreater(app.view.cell_size, 80)
+        initial_size = app.view.cell_size
+        app.view.zoom(app.view.rect.center, 1)
+        self.assertGreater(app.view.cell_size, initial_size)
+        app.view.zoom(app.view.rect.center, -20)
+        self.assertAlmostEqual(app.view.cell_size, initial_size)
+        send(app, [click(app.view.to_screen((2, 2)))])
+        self.assertIsNotNone(app.session.motion)
 
 
 if __name__ == "__main__":
-    run_tests()
+    unittest.main()

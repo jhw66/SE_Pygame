@@ -1,377 +1,433 @@
+"""Pygame 入口：关卡配置、窗口事件和异步生成。导入不会启动游戏。"""
+import argparse
+from pathlib import Path
+import queue
+import random
+import threading
+import time
 import pygame
-from game_logic import DIRECTIONS, can_exit, count_arrows
-from levels import generate_level
 
-# pygame各模块初始化
-pygame.init()
+from board_view import BoardView, BACKGROUND, ARROW_COLOR, ERROR_COLOR
+from game_state import GameSession, FAILED, WON
+from levels import (GenerationCancelled, GenerationError, LevelConfig,
+                    generate_level, level_metrics, load_level)
 
-# 基础窗口设置
-WINDOW_WIDTH=960
-WINDOW_HEIGHT=640
-screen=pygame.display.set_mode((WINDOW_WIDTH,WINDOW_HEIGHT))
-pygame.display.set_caption("一箭又一箭")
-# 窗口背景
-BACKGROUND_COLOR=(30,35,45)
-# 生成随机可解棋盘
-INITIAL_BOARD = generate_level()
-# 棋盘单格大小与格数
-ROWS = len(INITIAL_BOARD)
-COLS = len(INITIAL_BOARD[0])
-CELL_SIZE = 80
-# 棋盘位置
-BOARD_X = 280
-BOARD_Y = 140
-# 棋盘内格、箭头箭体、选择箭头、文字、按钮颜色设置
-GRID_COLOR = (85, 95, 115)
-ARROW_COLOR = (100, 225, 190)
-SELECTED_COLOR = (255, 210, 90)
-TEXT_COLOR = (235, 240, 250)
-MUTED_TEXT_COLOR = (170, 180, 200)
-ERROR_COLOR = (255, 120, 120)
-BUTTON_COLOR = (55, 75, 90)
-# 最大失败次数
-MAX_MISTAKES = 3
-# 飞行相关参数
-FLY_SPEED = 320  # 像素/秒：改变这个值，就能调整飞出速度
-ARROW_EXTENT = 24  # 箭头中心到最外侧的保守距离，包含线条宽度
-COLLISION_DURATION = 0.25  # 碰撞变红持续的秒数，与飞出共用每帧的 dt
-# 游戏状态
-PLAYING = "playing"
-FAILED = "failed"
-WON = "won"
-# 箭头方向名字
-DIRECTION_NAMES = {
-    "U": "上",
-    "D": "下",
-    "L": "左",
-    "R": "右",
-}
-
-# 可点击棋盘大小与位置设置
-board_rect = pygame.Rect(BOARD_X,BOARD_Y,COLS * CELL_SIZE,ROWS * CELL_SIZE)
-
-# 字体设置
-font_path = pygame.font.match_font(["microsoftyahei","simhei","simsun"])
-title_font = pygame.font.Font(font_path, 38) # 标题字体
-info_font = pygame.font.Font(font_path, 22)  # 提示字体
-
-# 游玩画面
-title_surface = title_font.render("一箭又一箭", True, TEXT_COLOR)
-title_rect = title_surface.get_rect(center=(WINDOW_WIDTH // 2, 50))
-hint_surface = info_font.render("无阻挡即可消除，点击受阻箭头消耗 1 次机会",True,MUTED_TEXT_COLOR)
-hint_rect = hint_surface.get_rect(center=(WINDOW_WIDTH // 2, 100))
-# 失败画面
-failed_title_surface = title_font.render("本关失败", True, ERROR_COLOR)
-failed_title_rect = failed_title_surface.get_rect(center=(WINDOW_WIDTH // 2, 50))
-failed_hint_surface = info_font.render("失误机会已用尽，点击右侧按钮重新开始", True, MUTED_TEXT_COLOR)
-failed_hint_rect = failed_hint_surface.get_rect(center=(WINDOW_WIDTH // 2, 100))
-# 通关画面
-won_title_surface = title_font.render("本题通关", True, ARROW_COLOR)
-won_title_rect = won_title_surface.get_rect(center=(WINDOW_WIDTH // 2, 50))
-won_hint_surface = info_font.render("所有箭头已清空！点击换一题继续挑战", True, MUTED_TEXT_COLOR,)
-won_hint_rect = won_hint_surface.get_rect(center=(WINDOW_WIDTH // 2, 100))
-# 重新开始按钮
-restart_rect = pygame.Rect(720, 480, 160, 48)
-restart_surface = info_font.render("重新开始", True, TEXT_COLOR)
-restart_text_rect = restart_surface.get_rect(center=restart_rect.center)
-# 换题按钮
-new_puzzle_rect = pygame.Rect(720, 416, 160, 48)
-new_puzzle_surface = info_font.render("换一题", True, TEXT_COLOR)
-new_puzzle_text_rect = new_puzzle_surface.get_rect(center=new_puzzle_rect.center)
+TEXT = (235, 240, 250)
+MUTED = (170, 180, 200)
+BUTTON = (55, 75, 90)
 
 
-# 绘制棋盘内格逻辑
-def draw_grid(surface):
-    for row in range(ROWS):
-        for col in range(COLS):
-            # 列号决定横坐标，行号决定纵坐标。
-            x = BOARD_X + col * CELL_SIZE
-            y = BOARD_Y + row * CELL_SIZE
+# 应用层连接窗口、游戏状态、棋盘视图和后台关卡任务。
+class GameApp:
+    def __init__(self, screen, config=None, board=None, seed=None, level_factory=None):
+        self.screen = screen
+        self.config = config if config is not None or board is not None else LevelConfig()
+        self.level_factory = level_factory or generate_level
+        # 允许测试替换生成函数，复现生成失败、取消与延迟返回等情况。
+        self.rng = random.Random(seed)
+        self.color_rng = random.Random(seed)  # 配色不消耗关卡生成的随机数序列
+        self.session = None
+        self.metrics = None
+        self.running = True
+        self.generating = False
+        self.notice = ""
+        self.dragging = False
+        self.left_press = None
+        self.results = queue.SimpleQueue()
+        # 队列传递后台结果；任务编号用于识别已取消的旧结果。
+        self.job_id = 0
+        self.cancel_event = None
+        self.worker = None
+        font_path = pygame.font.match_font(["microsoftyahei", "simhei", "simsun"])
+        self.font = pygame.font.Font(font_path, 20)
+        self.small_font = pygame.font.Font(font_path, 17)
+        self.compact_font = pygame.font.Font(font_path, 14)
+        rows = board.rows if board is not None else self.config.rows
+        cols = board.cols if board is not None else self.config.cols
+        self.view = BoardView(self.layout_ui(rows, cols), rows, cols)
+        if board is not None:
+            self.install(board)
+        else:
+            self.request_new()
 
-            cell_rect = pygame.Rect(x, y, CELL_SIZE, CELL_SIZE)
-            pygame.draw.rect(surface, GRID_COLOR, cell_rect, width=1)
+    def layout_ui(self, rows, cols):
+        """棋盘在整窗居中；控件使用自然留白，不覆盖任何可玩格子。"""
+        w, h = self.screen.get_size()
 
-# 绘制箭头(直线＋箭头)逻辑
-def draw_arrow(surface, cx, cy, direction, color=ARROW_COLOR):
-    if direction == "R":
-        start = (cx - 20, cy)
-        end = (cx + 10, cy)
-        points = [
-            (cx + 22, cy),
-            (cx + 8, cy - 12),
-            (cx + 8, cy + 12),
-        ]
-    elif direction == "L":
-        start = (cx + 20, cy)
-        end = (cx - 10, cy)
-        points = [
-            (cx - 22, cy),
-            (cx - 8, cy - 12),
-            (cx - 8, cy + 12),
-        ]
-    elif direction == "U":
-        start = (cx, cy + 20)
-        end = (cx, cy - 10)
-        points = [
-            (cx, cy - 22),
-            (cx - 12, cy - 8),
-            (cx + 12, cy - 8),
-        ]
-    elif direction == "D":
-        start = (cx, cy - 20)
-        end = (cx, cy + 10)
-        points = [
-            (cx, cy + 22),
-            (cx - 12, cy + 8),
-            (cx + 12, cy + 8),
-        ]
-    else:
-        return
+        def fitted(width, height):
+            scale = min(width / cols, height / rows)
+            rect = pygame.Rect(0, 0, round(cols * scale), round(rows * scale))
+            rect.center = (w // 2, h // 2)
+            return rect
 
-    pygame.draw.line(surface, color, start, end, width=5)
-    pygame.draw.polygon(surface, color, points)
+        area = fitted(w - 16, h - 16)
+        # 优先用棋盘左右的自然留白放控件，空间不足时改用上下窄栏。
+        if area.left >= 104:
+            self.hud_mode = "sides"
+            panel_width = min(180, area.left - 24)
+            left_x = (area.left - panel_width) // 2
+            right_x = area.right + (w - area.right - panel_width) // 2
+            self.summary_rect = pygame.Rect(left_x, h // 2 - 134, panel_width, 94)
+            self.status_rect = pygame.Rect(left_x, h // 2 - 24, panel_width, min(240, h // 2 - 4))
+            first_y = h // 2 - 106
+            self.buttons = {
+                key: pygame.Rect(right_x, first_y + i * 54, panel_width, 42)
+                for i, key in enumerate(("new", "restart", "fit"))
+            }
+            self.help_rect = pygame.Rect(right_x, first_y + 176, panel_width, 110)
+        else:
+            # 无足够自然留白时，只预留两条窄边带，棋盘仍在窗口正中。
+            if area.top < 56:
+                area = fitted(w - 16, h - 112)
+            self.hud_mode = "bars"
+            self.summary_rect = pygame.Rect(16, area.top - 44, w // 2 - 24, 30)
+            self.help_rect = pygame.Rect(w // 2, area.top - 44, w // 2 - 16, 30)
+            self.buttons = {
+                key: pygame.Rect(16 + i * 122, area.bottom + 8, 112, 40)
+                for i, key in enumerate(("new", "restart", "fit"))
+            }
+            self.status_rect = pygame.Rect(392, area.bottom + 7, w - 408,
+                                           min(110, h - area.bottom - 15))
+        return area
 
-# 在棋盘上绘制箭头逻辑
-def draw_arrows(surface, flying_arrow, collision_cell):
-    for row in range(ROWS):
-        for col in range(COLS):
-            direction = board[row][col]
-            if direction is None:
+    def install(self, board, metrics=None):
+        # 新题统一加载布局、全景和配色，同时清理未结束的鼠标手势。
+        if self.session is None:
+            self.session = GameSession(board)
+        else:
+            self.session.load(board)
+        self.view.rect = self.layout_ui(board.rows, board.cols)
+        self.view.set_board(board.rows, board.cols)
+        self.view.assign_colors(board, self.color_rng)
+        self.metrics = level_metrics(board) if metrics is None else metrics
+        self.notice = ""
+        self.cancel_pointer()
+
+    def cancel_pointer(self):
+        # 清除拖动和待确认点击，防止重开后处理旧的松开事件。
+        self.dragging = False
+        self.left_press = None
+
+    def cancel_generation(self):
+        # 请求旧任务尽快停止，并立即让其编号失效，不阻塞窗口等待线程。
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+        self.job_id += 1
+        self.generating = False
+
+    def request_new(self):
+        # 手工关卡不能换题；生成期间保留当前布局，只暂停棋盘操作。
+        if self.config is None or self.generating:
+            return
+        self.cancel_generation()
+        self.cancel_event = threading.Event()
+        self.generating = True
+        self.cancel_pointer()
+        self.notice = "正在生成可解关卡……"
+        if self.session is not None:
+            self.session.motion = None
+            if self.session.mistakes_remaining == 0:
+                self.session.state = FAILED
+        token = self.job_id
+        cancel = self.cancel_event
+        previous = self.session.initial.copy() if self.session is not None else None
+        # 每个任务拥有独立 RNG，旧任务取消后不会与新任务争用随机数状态。
+        rng = random.Random(self.rng.getrandbits(64))
+
+        def work():
+            # 后台只做数据计算，通过线程安全队列返回，不操作 Pygame 窗口。
+            deadline = time.monotonic() + 5.0
+
+            def checkpoint():
+                if cancel.is_set():
+                    raise GenerationCancelled("已取消生成")
+                if time.monotonic() >= deadline:
+                    raise GenerationError("生成超时，请调整关卡配置")
+
+            try:
+                board = self.level_factory(self.config, previous=previous, rng=rng, cancel_event=cancel)
+                checkpoint()
+                metrics = level_metrics(board, checkpoint)
+                self.results.put((token, board, metrics, None))
+            except Exception as exc:
+                self.results.put((token, None, None, str(exc)))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        # 启动后台任务后立刻返回，主循环继续处理关闭、缩放与绘制。
+        self.worker.start()
+
+    def restart(self):
+        # 恢复同一道题，不重置视图和颜色，也不消耗关卡随机数。
+        self.cancel_generation()
+        if self.session is not None:
+            self.session.restart()
+        self.notice = ""
+        self.cancel_pointer()
+
+    def update(self, dt):
+        # 主线程领取结果；旧任务即使晚到，也不能覆盖重开或新题
+        while True:
+            try:
+                token, board, metrics, error = self.results.get_nowait()
+            except queue.Empty:
+                break
+            if token != self.job_id:
                 continue
-
-            # 动画结束前，棋盘仍保留原箭头；绘图时跳过它，避免画出两个
-            if flying_arrow is not None:
-                if (row, col) == (flying_arrow["row"], flying_arrow["col"]):
-                    continue
-
-            # 格子左上角加上半个格子的边长，才是格子中心。
-            cx = BOARD_X + col * CELL_SIZE + CELL_SIZE // 2
-            cy = BOARD_Y + row * CELL_SIZE + CELL_SIZE // 2
-
-            # 设置箭头颜色（根据是否为选择错误的箭头）
-            color = ERROR_COLOR if (row, col) == collision_cell else ARROW_COLOR
-            draw_arrow(surface, cx, cy, direction, color)
-
-# 箭头飞行逻辑
-def update_flying_arrow(arrow, dt):
-    """更新显示坐标；整个箭头离开棋盘时返回 True，不修改棋盘。"""
-    dr, dc = DIRECTIONS[arrow["direction"]]
-    # dc 对应横向 x，dr 对应纵向 y；dt 的单位是秒。
-    arrow["x"] += dc * FLY_SPEED * dt
-    arrow["y"] += dr * FLY_SPEED * dt
-
-    # 中心越界还不够，要等尾部也离开，避免箭头突然消失。
-    if dc == 1:
-        return arrow["x"] - ARROW_EXTENT >= board_rect.right
-    if dc == -1:
-        return arrow["x"] + ARROW_EXTENT <= board_rect.left
-    if dr == 1:
-        return arrow["y"] - ARROW_EXTENT >= board_rect.bottom
-    return arrow["y"] + ARROW_EXTENT <= board_rect.top
-
-# 箭头被选择绘制逻辑（不论是否可以飞出）
-def draw_selection(surface, selected):
-    if selected is None:
-        return
-    row, col = selected
-    selected_rect = pygame.Rect(
-        BOARD_X + col * CELL_SIZE,
-        BOARD_Y + row * CELL_SIZE,
-        CELL_SIZE,
-        CELL_SIZE,
-    )
-    pygame.draw.rect(surface, SELECTED_COLOR, selected_rect, width=4)
-
-# 重新开始逻辑
-def reset_game():
-    # 全局变量绑定
-    global board, game_state, mistakes_remaining, status_text, flying_arrow
-    global collision_cell, collision_remaining, selected_cell, selected_remaining
-
-    # 不仅复制外层列表，还要复制每一行，防止消除时改坏初始布局
-    board = [row[:] for row in INITIAL_BOARD]
-    # 重开游戏状态、失误次数、状态文字、飞行状态、碰撞状态、选中状态
-    game_state = PLAYING
-    mistakes_remaining = MAX_MISTAKES
-    status_text = "点击一个箭头，检查它能否离开棋盘"
-    flying_arrow = None
-    collision_cell = None
-    collision_remaining = 0.0
-    selected_cell = None
-    selected_remaining = 0.0
-
-
-clock=pygame.time.Clock()
-running=True  
-reset_game()
-while running:
-    # tick 每帧调用一次：限制帧率，并将经过的毫秒转换成秒
-    dt = clock.tick(60) / 1000
-    restarted_this_frame = False
-
-    # 选错箭头颜色变化持续事件
-    if collision_cell is not None:
-        collision_remaining = max(0.0, collision_remaining - dt)
-        if collision_remaining == 0:
-            collision_cell = None
-    # 选择箭头颜色变化持续事件
-    if selected_cell is not None:
-        selected_remaining = max(0.0, selected_remaining - dt)
-        if selected_remaining == 0:
-            selected_cell = None
-
-    for event in pygame.event.get():
-        if event.type==pygame.QUIT:
-            running=False
-        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if not running:
-                continue
-
-            # 触发重开事件
-            if restart_rect.collidepoint(event.pos):
-                reset_game()
-                restarted_this_frame = True
-                continue
-
-            # 触发换题事件
-            if new_puzzle_rect.collidepoint(event.pos):
-                INITIAL_BOARD = generate_level(previous=INITIAL_BOARD)
-                reset_game()
-                restarted_this_frame = True
-                continue
-
-            # 游戏重开、成功、失败、箭头飞行期间不进行棋盘内点击事件
-            if restarted_this_frame or game_state != PLAYING or flying_arrow is not None:
-                continue
-
-            # 触发棋盘内点击事件
-            if board_rect.collidepoint(event.pos):
-                mouse_x, mouse_y = event.pos
-                col = (mouse_x - BOARD_X) // CELL_SIZE
-                row = (mouse_y - BOARD_Y) // CELL_SIZE
-
-                # 点击的是箭头
-                if board[row][col] is not None:
-                    direction_name = DIRECTION_NAMES[board[row][col]]
-                    # 点击箭头可以飞出
-                    if can_exit(board, row, col):
-                        flying_arrow = {
-                            "row": row,
-                            "col": col,
-                            "direction": board[row][col],
-                            "x": BOARD_X + col * CELL_SIZE + CELL_SIZE / 2,
-                            "y": BOARD_Y + row * CELL_SIZE + CELL_SIZE / 2,
-                        }
-                        selected_cell = (row, col)
-                        selected_remaining = COLLISION_DURATION
-                        status_text = (
-                            f"正在飞出：第 {row + 1} 行，第 {col + 1} 列，"
-                            f"方向：{direction_name}"
-                        )
-                    # 点击箭头不可飞出
-                    else:
-                        selected_cell = (row, col)
-                        selected_remaining = COLLISION_DURATION
-                        collision_cell = (row, col)
-                        collision_remaining = COLLISION_DURATION
-                        mistakes_remaining -= 1
-                        if mistakes_remaining == 0:
-                            game_state = FAILED
-                            status_text = "失误次数已耗尽，本关失败"
-                        else:
-                            status_text = (
-                                f"第 {row + 1} 行，第 {col + 1} 列："
-                                "前方有阻挡，失误机会减 1"
-                            )
-                    print(status_text)
-                # 点击的是空格
-                else:
-                    selected_cell = None
-                    status_text = "这里是空格，请点击箭头"
-            # 点击的是棋盘外且非重开换题
+            self.generating = False
+            if error is not None:
+                self.notice = "生成失败：" + error
             else:
-                selected_cell = None
-                status_text = "请点击棋盘内的箭头"
+                self.install(board, metrics)
+        if self.session is not None and not self.generating:
+            self.session.update(dt)
 
-    # 当游戏可以继续运行并且有飞行箭头时
-    if running and game_state == PLAYING and flying_arrow is not None:
-        if update_flying_arrow(flying_arrow, dt):
-            # 完全飞出去以后的处理
-            row, col = flying_arrow["row"], flying_arrow["col"]
-            direction_name = DIRECTION_NAMES[flying_arrow["direction"]]
-            board[row][col] = None
-            flying_arrow = None
-            status_text = (
-                f"已消除：第 {row + 1} 行，第 {col + 1} 列，"
-                f"方向：{direction_name}"
-            )
-            # 完全飞出之后成功处理
-            if count_arrows(board) == 0:
-                game_state = WON
-                selected_cell = None
-                selected_remaining = 0.0
-                collision_cell = None
-                collision_remaining = 0.0
-                status_text = "本题通关！可以换一题，或重新开始练习本题"
+    def handle_events(self, events):
+        # 同一批事件中重开或换题后，忽略随后排队的棋盘点击。
+        suppress_clicks = False
+        for event in events:
+            if event.type == pygame.QUIT:
+                self.running = False
+                self.cancel_generation()
+                break
+            if event.type == pygame.VIDEORESIZE:
+                # 窗口变动后重新安排控件，再保持或调整原观察位置。
+                self.cancel_pointer()
+                self.screen = pygame.display.set_mode((max(800, event.w), max(600, event.h)), pygame.RESIZABLE)
+                self.view.resize(self.layout_ui(self.view.rows, self.view.cols))
+            elif event.type == pygame.MOUSEWHEEL:
+                # 普通滚轮缩放，Shift 加滚轮或横向滚轮负责左右平移。
+                pos = getattr(event, "pos", pygame.mouse.get_pos())
+                if not self.view.rect.collidepoint(pos):
+                    continue
+                self.left_press = None
+                dx = getattr(event, "precise_x", getattr(event, "x", 0))
+                dy = getattr(event, "precise_y", getattr(event, "y", 0))
+                mods = getattr(event, "mod", pygame.key.get_mods())
+                step = self.view.cell_size * 2
+                if dx:
+                    # 触控板或横向滚轮：向右滚动时，棋盘内容向左移动。
+                    self.view.pan(-dx * step, dy * step)
+                elif mods & pygame.KMOD_SHIFT:
+                    self.view.pan(dy * step, 0)
+                else:
+                    self.view.zoom(pos, dy)
+            elif event.type == pygame.KEYDOWN:
+                # 方向键移动观察区域，位移以当前格子大小为单位。
+                moves = {pygame.K_LEFT: (1, 0), pygame.K_RIGHT: (-1, 0),
+                         pygame.K_UP: (0, 1), pygame.K_DOWN: (0, -1)}
+                if event.key in moves:
+                    self.left_press = None
+                    dx, dy = moves[event.key]
+                    self.view.pan(dx * self.view.cell_size * 2, dy * self.view.cell_size * 2)
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 2:
+                self.dragging = False
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                # 左键松开才确认点击；已经拖动或跨格的手势不会触发消除。
+                press, self.left_press = self.left_press, None
+                if press is None or press["dragged"] or not press["can_click"] or suppress_clicks:
+                    continue
+                dx, dy = event.pos[0] - press["start"][0], event.pos[1] - press["start"][1]
+                if dx * dx + dy * dy >= 36:
+                    continue
+                cell = self.view.cell_at(event.pos)
+                if cell is not None and cell == press["cell"] and not self.generating and self.session is not None:
+                    if self.view.can_click:
+                        if self.session.click(cell):
+                            self.notice = ""
+                    else:
+                        self.notice = "当前为全景概览，请滚轮放大后点击头部格"
+            elif event.type == pygame.MOUSEMOTION:
+                # 位移达到六像素就认定为拖动，后续只平移而不点击。
+                if self.dragging:
+                    self.view.pan(*event.rel)
+                elif self.left_press is not None:
+                    press = self.left_press
+                    pos = event.pos
+                    dx, dy = pos[0] - press["start"][0], pos[1] - press["start"][1]
+                    if not press["dragged"] and dx * dx + dy * dy >= 36:
+                        press["dragged"] = True
+                        self.view.pan(dx, dy)
+                    elif press["dragged"]:
+                        self.view.pan(pos[0] - press["last"][0], pos[1] - press["last"][1])
+                    press["last"] = pos
+            elif event.type == pygame.WINDOWFOCUSLOST:
+                # 切出窗口时取消手势，避免回来后出现粘住拖动或误点击。
+                self.cancel_pointer()
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 2:
+                    self.left_press = None
+                    self.dragging = self.view.rect.collidepoint(event.pos)
+                    continue
+                if event.button != 1:
+                    continue
+                self.left_press = None
+                if self.buttons["fit"].collidepoint(event.pos):
+                    self.cancel_pointer()
+                    self.view.fit()
+                elif self.buttons["restart"].collidepoint(event.pos):
+                    if self.session is not None:
+                        self.restart()
+                        suppress_clicks = True
+                elif self.buttons["new"].collidepoint(event.pos):
+                    if self.config is not None and not self.generating:
+                        self.request_new()
+                        suppress_clicks = True
+                elif not suppress_clicks and self.view.rect.collidepoint(event.pos):
+                    # 按下时仅记录候选点击位置及资格，等待松开或转为拖动。
+                    self.left_press = {
+                        "start": event.pos, "last": event.pos,
+                        "cell": self.view.cell_at(event.pos), "dragged": False,
+                        "can_click": not self.generating and self.session is not None
+                                     and self.session.motion is None,
+                    }
 
-    # 画面整体颜色
-    screen.fill(BACKGROUND_COLOR)
+    def draw_text(self, text, pos, color=TEXT, font=None):
+        self.screen.blit((font or self.font).render(text, True, color), pos)
 
-    # 游戏失败画面
-    if game_state == FAILED:
-        screen.blit(failed_title_surface, failed_title_rect)
-        screen.blit(failed_hint_surface, failed_hint_rect)
-    # 游戏成功画面
-    elif game_state == WON:
-        screen.blit(won_title_surface, won_title_rect)
-        screen.blit(won_hint_surface, won_hint_rect)
-    # 游戏游玩画面
+    def draw_fitted(self, text, rect, color=TEXT, centered=False):
+        """窄边栏也能完整显示必要文字；不让文字越过棋盘边界。"""
+        font = self.compact_font
+        for candidate in (self.font, self.small_font, self.compact_font):
+            if candidate.size(text)[0] <= rect.width:
+                font = candidate
+                break
+        while text and font.size(text)[0] > rect.width:
+            text = text[:-2] + "…" if len(text) > 2 else ""
+        surface = font.render(text, True, color)
+        pos = surface.get_rect(center=rect.center) if centered else rect.topleft
+        self.screen.blit(surface, pos)
+
+    def draw_wrapped(self, text, rect, color=MUTED):
+        # 窄边栏按像素宽度换行，超出可用高度时截断并显示省略号。
+        font = self.compact_font if rect.width < 110 else self.small_font
+        lines, line = [], ""
+        for char in text:
+            if char == "\n":
+                lines.append(line)
+                line = ""
+                continue
+            if font.size(line + char)[0] > rect.width and line:
+                lines.append(line)
+                line = ""
+            line += char
+        lines.append(line)
+        step = font.get_linesize() + 4
+        limit = max(1, rect.height // step)
+        if len(lines) > limit:
+            lines = lines[:limit]
+            lines[-1] = lines[-1][:-1] + "…"
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(rect.clip(old_clip))
+        for i, line in enumerate(lines):
+            self.draw_text(line, (rect.x, rect.y + i * step), color, font)
+        self.screen.set_clip(old_clip)
+
+    def draw(self):
+        # 先画棋盘，再在独立区域显示必要状态、简短说明和三个按钮。
+        screen = self.screen
+        screen.fill(BACKGROUND)
+        pygame.draw.rect(screen, (36, 43, 56), self.view.rect)
+        if self.session is not None:
+            self.view.draw(screen, self.session)
+        else:
+            message = "正在准备棋盘…" if self.generating else "请点击换一题重试"
+            self.draw_fitted(message, self.view.rect, MUTED, centered=True)
+
+        title, color = "一箭又一箭", TEXT
+        remaining = len(self.session.board.arrows) if self.session is not None else "—"
+        chances = self.session.mistakes_remaining if self.session is not None else "—"
+        status = self.notice
+        if self.session is not None:
+            if self.session.state == FAILED:
+                title, color = "本关失败", ERROR_COLOR
+                status = status or "点击重新开始再试一次"
+            elif self.session.state == WON:
+                title, color = "本题通关", ARROW_COLOR
+                status = status or "重新开始或换一题"
+            elif self.session.motion is not None and self.session.motion.collided:
+                status = status or "碰撞后原路返回"
+        if not self.view.can_click:
+            status = status or "请滚轮放大后点击头部格"
+
+        rect = self.summary_rect
+        if self.hud_mode == "sides":
+            self.draw_fitted(title, pygame.Rect(rect.x, rect.y, rect.width, 26), color)
+            self.draw_fitted(f"箭头 {remaining}", pygame.Rect(rect.x, rect.y + 40, rect.width, 26))
+            self.draw_fitted(f"机会 {chances}", pygame.Rect(rect.x, rect.y + 72, rect.width, 26))
+            self.draw_wrapped("点击头部格\n滚轮缩放\n左键拖动\n← → 平移", self.help_rect)
+        else:
+            self.draw_fitted(f"{title}  ·  剩余 {remaining}  ·  机会 {chances}", rect, color)
+            self.draw_fitted("点击头部 · 滚轮缩放 · 拖动/←→平移", self.help_rect, MUTED)
+        self.draw_wrapped(status, self.status_rect,
+                          ERROR_COLOR if "失败" in status or color == ERROR_COLOR else MUTED)
+
+        labels = {"new": "生成中…" if self.generating else "换一题",
+                  "restart": "重新开始", "fit": "全景"}
+        for key, rect in self.buttons.items():
+            enabled = not ((key == "new" and (self.config is None or self.generating))
+                           or (key == "restart" and self.session is None))
+            pygame.draw.rect(screen, BUTTON if enabled else (39, 43, 52), rect, border_radius=8)
+            pygame.draw.rect(screen, (82, 133, 126) if enabled else GRID_DISABLED,
+                             rect, width=1, border_radius=8)
+            self.draw_fitted(labels[key], rect.inflate(-12, -8),
+                             TEXT if enabled else MUTED, centered=True)
+
+    def close(self):
+        self.cancel_generation()
+        self.running = False
+
+
+GRID_DISABLED = (75, 80, 90)
+
+
+def parse_args(argv=None):
+    # 命令行参数或 JSON 二选一创建关卡来源，错误配置在启动窗口前报告。
+    parser = argparse.ArgumentParser(description="可配置的箭头消除游戏")
+    parser.add_argument("--level", type=Path, help="随机配置或手工布局 JSON")
+    parser.add_argument("--seed", type=int, help="复现同一系列随机题")
+    for name in ("rows", "cols", "arrow-count", "min-length", "max-length"):
+        parser.add_argument("--" + name, type=int)
+    parser.add_argument("--turn-probability", type=float)
+    args = parser.parse_args(argv)
+    overrides = {name: getattr(args, name) for name in
+                 ("rows", "cols", "arrow_count", "min_length", "max_length", "turn_probability")
+                 if getattr(args, name) is not None}
+    if args.level is not None and overrides:
+        parser.error("--level 与行列/形状参数不能同时使用")
+    try:
+        source = load_level(args.level) if args.level is not None else LevelConfig(**overrides)
+    except (ValueError, TypeError, KeyError, OSError) as exc:
+        parser.error(str(exc))
+    return args, source
+
+
+def main(argv=None):
+    # 初始化窗口并进入事件、状态更新、绘制的逐帧循环。
+    args, source = parse_args(argv)
+    pygame.init()
+    pygame.key.set_repeat(250, 40)
+    pygame.display.set_caption("一箭又一箭")
+    screen = pygame.display.set_mode((960, 640), pygame.RESIZABLE)
+    if isinstance(source, LevelConfig):
+        app = GameApp(screen, config=source, seed=args.seed)
     else:
-        screen.blit(title_surface, title_rect)
-        screen.blit(hint_surface, hint_rect)
+        app = GameApp(screen, board=source, seed=args.seed)
+    clock = pygame.time.Clock()
+    try:
+        while app.running:
+            dt = clock.tick(60) / 1000
+            # tick 返回毫秒，换算为秒交给动画；速度不依赖实际帧数。
+            app.handle_events(pygame.event.get())
+            if not app.running:
+                break
+            app.update(dt)
+            app.draw()
+            pygame.display.flip()
+    finally:
+        app.close()
+        pygame.quit()
 
-    # 绘制棋盘内格
-    draw_grid(screen)
 
-    # 绘制箭头
-    draw_arrows(screen, flying_arrow, collision_cell)
-
-    # 绘制飞行箭头
-    if flying_arrow is not None:
-        screen.set_clip(board_rect)
-        draw_arrow(screen, flying_arrow["x"], flying_arrow["y"],flying_arrow["direction"])
-        screen.set_clip(None)
-
-    # 绘制箭头选择
-    draw_selection(screen, selected_cell)
-
-    # 重开按钮
-    pygame.draw.rect(screen, BUTTON_COLOR, restart_rect, border_radius=8)
-    pygame.draw.rect(screen, ARROW_COLOR, restart_rect, width=2, border_radius=8)
-    screen.blit(restart_surface, restart_text_rect)
-
-    # 换题按钮
-    pygame.draw.rect(screen, BUTTON_COLOR, new_puzzle_rect, border_radius=8)
-    pygame.draw.rect(screen, ARROW_COLOR, new_puzzle_rect, width=2, border_radius=8)
-    screen.blit(new_puzzle_surface, new_puzzle_text_rect)
-
-    # 剩余箭头与机会提示
-    remaining_arrows = count_arrows(board)
-    count_surface = info_font.render(
-        f"剩余箭头：{remaining_arrows}    剩余失误次数：{mistakes_remaining}",
-        True,
-        TEXT_COLOR,
-    )
-    count_rect = count_surface.get_rect(center=(WINDOW_WIDTH // 2, 565))
-    screen.blit(count_surface, count_rect)
-
-    # 状态文字提示
-    status_color = ERROR_COLOR if game_state == FAILED else TEXT_COLOR
-    status_surface = info_font.render(status_text, True, status_color)
-    status_rect = status_surface.get_rect(center=(WINDOW_WIDTH // 2, 605))
-    screen.blit(status_surface, status_rect)
-
-    # 刷新显示
-    pygame.display.flip()
-
-pygame.quit()
+if __name__ == "__main__":
+    # 直接运行才启动游戏；测试导入 main 时不会弹窗。
+    main()
