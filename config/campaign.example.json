@@ -1,0 +1,9 @@
+{
+  "levels": [
+    {"name": "初识方向", "rows": 5, "cols": 5, "arrow_count": 20, "lives": 3, "min_length": 1, "max_length": 6, "turn_probability": 0.45},
+    {"name": "解除阻挡", "rows": 10, "cols": 10, "arrow_count": 70, "lives": 3, "min_length": 1, "max_length": 6, "turn_probability": 0.45},
+    {"name": "步步推进", "rows": 15, "cols": 15, "arrow_count": 160, "lives": 3, "min_length": 1, "max_length": 6, "turn_probability": 0.45},
+    {"name": "密阵挑战", "rows": 20, "cols": 20, "arrow_count": 280, "lives": 3, "min_length": 1, "max_length": 6, "turn_probability": 0.45},
+    {"name": "箭阵终章", "rows": 25, "cols": 25, "arrow_count": 450, "lives": 3, "min_length": 1, "max_length": 6, "turn_probability": 0.45}
+  ]
+}

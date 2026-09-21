@@ -1,6 +1,6 @@
 """Pygame 入口：关卡配置、窗口事件和异步生成"""
 import argparse
-from pathlib import Path
+import math
 import queue
 import random
 import threading
@@ -8,25 +8,35 @@ import pygame
 
 from board_view import BoardView, BACKGROUND, ARROW_COLOR, ERROR_COLOR
 from game_state import GameSession, FAILED, WON
-from levels import LevelConfig, generate_level, load_level
+from levels import generate_level
+from campaign import Campaign, LEVEL_COUNT, read_admin_password
 
 TEXT = (235, 240, 250)
 MUTED = (170, 180, 200)
 BUTTON = (55, 75, 90)
+HEART_RED = (240, 76, 100)
+HEART_GREY = (91, 98, 112)
+HOME, GAME, ADMIN = "home", "game", "admin"
 
 
 # 应用层连接窗口、游戏状态、棋盘视图和后台关卡任务。
 class GameApp:
-    def __init__(self, screen, source, seed=None):
+    def __init__(self, screen, seed=None, admin_path=None, config_path=None):
         self.screen = screen
-        # 关卡来源只有一种：随机配置，或已加载的手工棋盘。
-        self.config = source if isinstance(source, LevelConfig) else None
+        self.campaign = Campaign(admin_path, config_path)
+        self.page = HOME
+        self.current_level = None  # 首页尚未选择关卡
+        self.previous_boards = {}
+        self.admin_input = ""
+        self.admin_message = ""
+        # 选择关卡后，从五关 JSON 配置取得生成参数。
+        self.config = None
         self.rng = random.Random(seed)
         self.color_rng = random.Random(seed)  # 配色不消耗关卡生成的随机数序列
         self.session = None
         self.running = True
         self.generating = False
-        self.notice = ""
+        self.notice = self.campaign.config_error
         self.dragging = False
         self.left_press = None
         self.results = queue.SimpleQueue()
@@ -37,12 +47,11 @@ class GameApp:
         self.font = pygame.font.Font(font_path, 20)
         self.small_font = pygame.font.Font(font_path, 17)
         self.compact_font = pygame.font.Font(font_path, 14)
-        rows, cols = source.rows, source.cols
+        # 配置缺失时只显示首页错误提示，视图使用不可游玩的占位尺寸。
+        first = self.campaign.levels[0].config if self.campaign.levels else None
+        rows, cols = (first.rows, first.cols) if first is not None else (1, 1)
         self.view = BoardView(self.layout_ui(rows, cols), rows, cols)
-        if self.config is not None:
-            self.request_new()
-        else:
-            self.install(source)
+        self.layout_menu()
 
     def layout_ui(self, rows, cols):
         """棋盘在整窗居中；控件使用自然留白，不覆盖任何可玩格子。"""
@@ -54,6 +63,7 @@ class GameApp:
             rect.center = (w // 2, h // 2)
             return rect
 
+        keys = ("new", "restart", "fit", "next", "home")
         area = fitted(w - 16, h - 16)
         # 优先用棋盘左右的自然留白放控件，空间不足时改用上下窄栏。
         if area.left >= 104:
@@ -61,38 +71,168 @@ class GameApp:
             panel_width = min(180, area.left - 24)
             left_x = (area.left - panel_width) // 2
             right_x = area.right + (w - area.right - panel_width) // 2
-            self.summary_rect = pygame.Rect(left_x, h // 2 - 134, panel_width, 94)
-            self.status_rect = pygame.Rect(left_x, h // 2 - 24, panel_width, min(240, h // 2 - 4))
-            first_y = h // 2 - 106
+            self.summary_rect = pygame.Rect(left_x, h // 2 - 134, panel_width, 130)
+            self.health_rect = pygame.Rect(left_x, h // 2 - 6, panel_width, 54)
+            self.status_rect = pygame.Rect(left_x, h // 2 + 66, panel_width, min(190, h // 2 - 86))
+            first_y = h // 2 - 150
             self.buttons = {
                 key: pygame.Rect(right_x, first_y + i * 54, panel_width, 42)
-                for i, key in enumerate(("new", "restart", "fit"))
+                for i, key in enumerate(keys)
             }
-            self.help_rect = pygame.Rect(right_x, first_y + 176, panel_width, 110)
+            self.help_rect = pygame.Rect(right_x, first_y + len(keys) * 54 + 10, panel_width, 110)
         else:
             # 无足够自然留白时，只预留两条窄边带，棋盘仍在窗口正中。
-            if area.top < 56:
-                area = fitted(w - 16, h - 112)
+            if area.top < 84:
+                area = fitted(w - 16, h - 168)
             self.hud_mode = "bars"
             self.summary_rect = pygame.Rect(16, area.top - 44, w // 2 - 24, 30)
-            self.help_rect = pygame.Rect(w // 2, area.top - 44, w // 2 - 16, 30)
+            self.health_rect = pygame.Rect(w // 2 + 12, area.top - 64, w // 2 - 28, 26)
+            self.help_rect = pygame.Rect(w // 2, area.top - 32, w // 2 - 16, 26)
             self.buttons = {
-                key: pygame.Rect(16 + i * 122, area.bottom + 8, 112, 40)
-                for i, key in enumerate(("new", "restart", "fit"))
+                key: pygame.Rect(16 + i * ((w - 32) // len(keys)), area.bottom + 8,
+                                 (w - 32) // len(keys) - 8, 40)
+                for i, key in enumerate(keys)
             }
-            self.status_rect = pygame.Rect(392, area.bottom + 7, w - 408,
-                                           min(110, h - area.bottom - 15))
+            self.status_rect = pygame.Rect(16, area.bottom + 54, w - 32, 26)
         return area
+
+    def layout_menu(self):
+        w, h = self.screen.get_size()
+        width = min(680, w - 64)
+        left = (w - width) // 2
+        button_width = (width - 12) // 2
+        self.menu_buttons = {
+            name: pygame.Rect(left + i * (button_width + 12), 122, button_width, 42)
+            for i, name in enumerate(("admin", "reload"))
+        }
+        spacing = min(66, (h - 270) // LEVEL_COUNT)
+        self.level_buttons = [pygame.Rect(left, 184 + i * spacing, width, spacing - 8)
+                              for i in range(LEVEL_COUNT)]
+        self.password_rect = pygame.Rect(w // 2 - 240, h // 2 - 26, 480, 52)
+        self.admin_buttons = {
+            "submit": pygame.Rect(w // 2 - 190, h // 2 + 46, 180, 42),
+            "cancel": pygame.Rect(w // 2 + 10, h // 2 + 46, 180, 42),
+        }
+        self.failure_rect = pygame.Rect(w // 2 - 260, h // 2 - 140, 520, 280)
+        self.failure_buttons = {
+            "restart": pygame.Rect(w // 2 - 224, h // 2 + 50, 212, 48),
+            "home": pygame.Rect(w // 2 + 12, h // 2 + 50, 212, 48),
+        }
+
+    @property
+    def current_max_lives(self):
+        return self.campaign.levels[self.current_level].lives
+
+    @property
+    def failure_visible(self):
+        return (self.page == GAME and self.session is not None
+                and self.session.mistakes_remaining == 0 and not self.generating)
+
+    def reload_campaign(self):
+        changed, message = self.campaign.reload_config()
+        if changed:
+            self.previous_boards.clear()
+        self.notice = message + ("；继续使用上次有效配置" if self.campaign.config_error
+                                and self.campaign.levels else "")
+
+    def open_level(self, index):
+        if not self.campaign.can_enter(index):
+            self.notice = self.campaign.config_error or "请先通过前一关，或使用管理员入口解锁"
+            return
+        self.cancel_generation()
+        self.cancel_pointer()
+        self.current_level = index
+        self.config = self.campaign.levels[index].config
+        self.session = None  # 旧关卡即使已通关，也不能被记入新关卡
+        self.page = GAME
+        self.view.rect = self.layout_ui(self.config.rows, self.config.cols)
+        self.view.set_board(self.config.rows, self.config.cols)
+        self.request_new()
+
+    def return_home(self):
+        self.cancel_generation()
+        self.cancel_pointer()
+        self.session = None
+        self.current_level = None
+        self.config = None
+        self.page = HOME
+        self.admin_input = ""
+        self.notice = "选关会生成新题；本次运行的通关进度已保留"
+        pygame.key.stop_text_input()
+
+    def open_admin(self):
+        self.cancel_pointer()
+        self.page = ADMIN
+        self.admin_input = ""
+        _, error = read_admin_password(self.campaign.admin_path)
+        self.admin_message = error or "输入本地 JSON 中设置的密码"
+        pygame.key.set_text_input_rect(self.password_rect)
+        pygame.key.start_text_input()
+
+    def submit_admin(self):
+        success, message = self.campaign.authenticate(self.admin_input)
+        self.admin_input = ""
+        if success:
+            self.return_home()
+            self.notice = message
+        else:
+            self.admin_message = message
+        return success
+
+    def handle_menu_event(self, event):
+        """返回 True 时，本批后续操作不再穿透到新的页面。"""
+        if self.page == ADMIN:
+            if event.type == pygame.TEXTINPUT:
+                self.admin_input += event.text
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.return_home()
+                    return True
+                if event.key == pygame.K_BACKSPACE:
+                    self.admin_input = self.admin_input[:-1]
+                elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    return self.submit_admin()
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.admin_buttons["cancel"].collidepoint(event.pos):
+                    self.return_home()
+                    return True
+                if self.admin_buttons["submit"].collidepoint(event.pos):
+                    return self.submit_admin()
+            return False
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return False
+        if self.menu_buttons["admin"].collidepoint(event.pos):
+            self.open_admin()
+            return True
+        if self.menu_buttons["reload"].collidepoint(event.pos):
+            self.reload_campaign()
+            return True
+        for index, rect in enumerate(self.level_buttons):
+            if rect.collidepoint(event.pos):
+                self.open_level(index)
+                return self.page == GAME
+        return False
+
+    def can_advance(self):
+        return (self.current_level is not None and not self.generating
+                and self.session is not None and not self.failure_visible
+                and (self.campaign.admin_unlocked or self.current_level in self.campaign.completed
+                     or self.session.state == WON)
+                and (self.current_level + 1 < LEVEL_COUNT
+                     or self.campaign.all_completed))
 
     def install(self, board):
         # 新题统一加载布局、全景和配色，同时清理未结束的鼠标手势。
         if self.session is None:
-            self.session = GameSession(board)
+            self.session = GameSession(board, self.current_max_lives)
         else:
+            self.session.max_lives = self.current_max_lives
             self.session.load(board)
         self.view.rect = self.layout_ui(board.rows, board.cols)
         self.view.set_board(board.rows, board.cols)
         self.view.assign_colors(board, self.color_rng)
+        if self.current_level is not None:
+            self.previous_boards[self.current_level] = board.copy()
         self.notice = ""
         self.cancel_pointer()
 
@@ -109,7 +249,7 @@ class GameApp:
         self.generating = False
 
     def request_new(self):
-        # 手工关卡不能换题；生成期间保留当前布局，只暂停棋盘操作。
+        # 生成期间保留当前布局，只暂停棋盘操作。
         if self.config is None or self.generating:
             return
         self.cancel_generation()
@@ -123,7 +263,9 @@ class GameApp:
                 self.session.state = FAILED
         token = self.job_id
         cancel = self.cancel_event
-        previous = self.session.initial.copy() if self.session is not None else None
+        previous = (self.session.initial.copy() if self.session is not None
+                    else self.previous_boards.get(self.current_level))
+        config = self.config  # 固定任务参数，切换关卡不能改变已启动线程的配置
         # 每个任务拥有独立 RNG，旧任务取消后不会与新任务争用随机数状态。
         rng = random.Random(self.rng.getrandbits(64))
 
@@ -131,7 +273,7 @@ class GameApp:
             # 后台只做数据计算，通过线程安全队列返回，不操作 Pygame 窗口。
             try:
                 # 时间预算与取消检查统一由生成器负责。
-                board = generate_level(self.config, previous=previous, rng=rng, cancel_event=cancel)
+                board = generate_level(config, previous=previous, rng=rng, cancel_event=cancel)
                 self.results.put((token, board, None))
             except Exception as exc:
                 self.results.put((token, None, str(exc)))
@@ -161,8 +303,12 @@ class GameApp:
                 self.notice = "生成失败：" + error
             else:
                 self.install(board)
-        if self.session is not None and not self.generating:
+        if self.page == GAME and self.session is not None and not self.generating:
             self.session.update(dt)
+            if self.failure_visible:
+                self.cancel_pointer()
+            if self.current_level is not None and self.session.state == WON:
+                self.campaign.record_win(self.current_level)
 
     def handle_events(self, events):
         # 同一批事件中重开或换题后，忽略随后排队的棋盘点击。
@@ -177,7 +323,33 @@ class GameApp:
                 self.cancel_pointer()
                 self.screen = pygame.display.set_mode((max(800, event.w), max(600, event.h)), pygame.RESIZABLE)
                 self.view.resize(self.layout_ui(self.view.rows, self.view.cols))
-            elif event.type == pygame.MOUSEWHEEL:
+                self.layout_menu()
+                if self.page == ADMIN:
+                    pygame.key.set_text_input_rect(self.password_rect)
+                continue
+            if suppress_clicks:
+                continue
+            if self.page != GAME:
+                suppress_clicks = self.handle_menu_event(event)
+                continue
+            if self.failure_visible:
+                # 失败弹窗独占输入，点击不能穿透到棋盘或其他按钮。
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if self.failure_buttons["restart"].collidepoint(event.pos):
+                        self.restart()
+                        suppress_clicks = True
+                    elif self.failure_buttons["home"].collidepoint(event.pos):
+                        self.return_home()
+                        suppress_clicks = True
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self.restart()
+                        suppress_clicks = True
+                    elif event.key == pygame.K_ESCAPE:
+                        self.return_home()
+                        suppress_clicks = True
+                continue
+            if event.type == pygame.MOUSEWHEEL:
                 # 普通滚轮缩放，Shift 加滚轮或横向滚轮负责左右平移。
                 pos = pygame.mouse.get_pos()
                 if not self.view.rect.collidepoint(pos):
@@ -244,7 +416,15 @@ class GameApp:
                 if event.button != 1:
                     continue
                 self.left_press = None
-                if self.buttons["fit"].collidepoint(event.pos):
+                if self.buttons["home"].collidepoint(event.pos):
+                    self.return_home()
+                    suppress_clicks = True
+                elif "next" in self.buttons and self.buttons["next"].collidepoint(event.pos):
+                    if self.can_advance():
+                        self.open_level(0 if self.current_level == LEVEL_COUNT - 1
+                                        else self.current_level + 1)
+                        suppress_clicks = True
+                elif self.buttons["fit"].collidepoint(event.pos):
                     self.cancel_pointer()
                     self.view.fit()
                 elif self.buttons["restart"].collidepoint(event.pos):
@@ -305,10 +485,105 @@ class GameApp:
             self.draw_text(line, (rect.x, rect.y + i * step), color, font)
         self.screen.set_clip(old_clip)
 
+    def draw_button(self, rect, label, enabled=True):
+        pygame.draw.rect(self.screen, BUTTON if enabled else (39, 43, 52), rect, border_radius=8)
+        pygame.draw.rect(self.screen, (82, 133, 126) if enabled else GRID_DISABLED,
+                         rect, width=1, border_radius=8)
+        self.draw_fitted(label, rect.inflate(-12, -8), TEXT if enabled else MUTED, centered=True)
+
+    def draw_health(self):
+        total = self.session.max_lives if self.session is not None else self.current_max_lives
+        remaining = self.session.mistakes_remaining if self.session is not None else total
+        rect = self.health_rect.copy()
+        if self.hud_mode == "sides":
+            self.draw_fitted(f"生命值 {remaining}/{total}", pygame.Rect(rect.x, rect.y, rect.w, 20))
+            rect.y += 24
+            rect.height -= 24
+        else:
+            self.draw_fitted(f"生命值 {remaining}/{total}", pygame.Rect(rect.x, rect.y, 100, rect.h))
+            rect.x += 108
+            rect.width -= 108
+        # 自绘心形，不依赖系统字体是否包含爱心字符。
+        size = 22
+        while size > 5:
+            columns = max(1, rect.width // (size + 4))
+            if math.ceil(total / columns) * (size + 4) <= rect.height:
+                break
+            size -= 1
+        columns = max(1, rect.width // (size + 4))
+        for i in range(total):
+            x = rect.x + (i % columns) * (size + 4)
+            y = rect.y + (i // columns) * (size + 4)
+            points = []
+            for step in range(48):
+                angle = step * math.tau / 48
+                px = 16 * math.sin(angle) ** 3
+                py = (13 * math.cos(angle) - 5 * math.cos(2 * angle)
+                      - 2 * math.cos(3 * angle) - math.cos(4 * angle))
+                points.append((round(x + (px + 16) / 32 * size),
+                               round(y + (12 - py) / 29 * size)))
+            pygame.draw.polygon(self.screen, HEART_RED if i < remaining else HEART_GREY, points)
+
+    def draw_failure(self):
+        shade = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 175))
+        self.screen.blit(shade, (0, 0))
+        rect = self.failure_rect
+        pygame.draw.rect(self.screen, (35, 43, 57), rect, border_radius=18)
+        pygame.draw.rect(self.screen, HEART_RED, rect, width=2, border_radius=18)
+        self.draw_fitted("生命值已耗尽", pygame.Rect(rect.x + 24, rect.y + 30, rect.w - 48, 34),
+                         HEART_RED, centered=True)
+        self.draw_fitted("重新开始本题，或回到主页选择关卡",
+                         pygame.Rect(rect.x + 24, rect.y + 82, rect.w - 48, 30), centered=True)
+        self.draw_fitted("Enter 重新开始 · Esc 返回主页",
+                         pygame.Rect(rect.x + 24, rect.y + 125, rect.w - 48, 26), MUTED, centered=True)
+        self.draw_button(self.failure_buttons["restart"], "重新开始")
+        self.draw_button(self.failure_buttons["home"], "回到主页选关")
+
+    def draw_menu(self):
+        w, h = self.screen.get_size()
+        if self.page == ADMIN:
+            self.draw_fitted("管理员解锁", pygame.Rect(32, 40, w - 64, 44), centered=True)
+            self.draw_fitted("密码读取 config/admin.json · 解锁仅本次运行有效",
+                             pygame.Rect(32, 94, w - 64, 32), MUTED, centered=True)
+            pygame.draw.rect(self.screen, BUTTON, self.password_rect, border_radius=8)
+            pygame.draw.rect(self.screen, ARROW_COLOR, self.password_rect, width=1, border_radius=8)
+            available = self.password_rect.width - 24
+            stars = "*" * min(len(self.admin_input), available // max(1, self.font.size("*")[0]))
+            self.draw_fitted(stars or "请输入密码", self.password_rect.inflate(-24, -16), TEXT)
+            self.draw_fitted(self.admin_message,
+                             pygame.Rect(24, self.password_rect.top - 42, w - 48, 30), MUTED, centered=True)
+            self.draw_button(self.admin_buttons["submit"], "验证并解锁")
+            self.draw_button(self.admin_buttons["cancel"], "返回首页")
+            self.draw_fitted("Enter 提交 · Backspace 删除 · Esc 返回",
+                             pygame.Rect(24, self.password_rect.bottom + 90, w - 48, 30), MUTED, centered=True)
+            return
+        self.draw_fitted("一箭又一箭 · 五关挑战", pygame.Rect(32, 32, w - 64, 40), centered=True)
+        self.draw_fitted("点击箭头头部 · 沿路径抽出 · 碰撞原路返回 · 滚轮缩放与拖动",
+                         pygame.Rect(24, 78, w - 48, 30), MUTED, centered=True)
+        for name, label in (("admin", "管理员入口"), ("reload", "重载配置")):
+            self.draw_button(self.menu_buttons[name], label)
+        for i, rect in enumerate(self.level_buttons):
+            if i >= len(self.campaign.levels):
+                self.draw_button(rect, f"第 {i + 1} 关 · 请修正 config/campaign.json 后重载配置", False)
+                continue
+            level = self.campaign.levels[i]
+            config = level.config
+            state = "已通关" if i in self.campaign.completed else "可挑战" if self.campaign.can_enter(i) else "未解锁"
+            label = f"第 {i + 1} 关 · {level.name} · {config.rows}×{config.cols} · {config.arrow_count} 支 · {level.lives} 生命 · {state}"
+            self.draw_button(rect, label, self.campaign.can_enter(i))
+        self.draw_fitted("管理员已解锁全部关卡" if self.campaign.admin_unlocked else "普通模式：通关后解锁下一关",
+                         pygame.Rect(24, h - 80, w - 48, 26), ARROW_COLOR, centered=True)
+        self.draw_fitted(self.notice or "点击关卡直接挑战；关闭游戏后进度与管理员权限重置",
+                         pygame.Rect(24, h - 44, w - 48, 26), MUTED, centered=True)
+
     def draw(self):
-        # 先画棋盘，再在独立区域显示必要状态、简短说明和三个按钮。
+        # 先画棋盘，再在独立区域显示状态、简短说明和当前模式的按钮。
         screen = self.screen
         screen.fill(BACKGROUND)
+        if self.page != GAME:
+            self.draw_menu()
+            return
         pygame.draw.rect(screen, (36, 43, 56), self.view.rect)
         if self.session is not None:
             self.view.draw(screen, self.session)
@@ -318,45 +593,54 @@ class GameApp:
 
         title, color = "一箭又一箭", TEXT
         remaining = len(self.session.board.arrows) if self.session is not None else "—"
-        chances = self.session.mistakes_remaining if self.session is not None else "—"
         status = self.notice
         if self.session is not None:
             if self.session.state == FAILED:
                 title, color = "本关失败", ERROR_COLOR
                 status = status or "点击重新开始再试一次"
             elif self.session.state == WON:
-                title, color = "本题通关", ARROW_COLOR
-                status = status or "重新开始或换一题"
+                title, color = "本关通关", ARROW_COLOR
+                if self.campaign.all_completed:
+                    title, status = "全部五关通关", status or "重新挑战或返回首页"
+                elif self.current_level == LEVEL_COUNT - 1:
+                    status = status or "本关已完成，其他关卡尚未全部通关，请返回首页继续挑战"
+                else:
+                    status = status or "点击下一关继续挑战"
             elif self.session.motion is not None and self.session.motion.collided:
                 status = status or "碰撞后原路返回"
         if not self.view.can_click:
             status = status or "请滚轮放大后点击头部格"
 
         rect = self.summary_rect
+        level_label = f"第 {self.current_level + 1} / {LEVEL_COUNT} 关"
         if self.hud_mode == "sides":
             self.draw_fitted(title, pygame.Rect(rect.x, rect.y, rect.width, 26), color)
-            self.draw_fitted(f"箭头 {remaining}", pygame.Rect(rect.x, rect.y + 40, rect.width, 26))
-            self.draw_fitted(f"机会 {chances}", pygame.Rect(rect.x, rect.y + 72, rect.width, 26))
+            self.draw_fitted(level_label, pygame.Rect(rect.x, rect.y + 34, rect.width, 26), MUTED)
+            self.draw_fitted(f"箭头 {remaining}", pygame.Rect(rect.x, rect.y + 68, rect.width, 26))
             self.draw_wrapped("点击头部格\n滚轮缩放\n左键拖动\n← → 平移", self.help_rect)
         else:
-            self.draw_fitted(f"{title}  ·  剩余 {remaining}  ·  机会 {chances}", rect, color)
+            self.draw_fitted(f"{level_label} · {title} · 剩余 {remaining}", rect, color)
             self.draw_fitted("点击头部 · 滚轮缩放 · 拖动/←→平移", self.help_rect, MUTED)
+        self.draw_health()
         self.draw_wrapped(status, self.status_rect,
                           ERROR_COLOR if "失败" in status or color == ERROR_COLOR else MUTED)
 
         labels = {"new": "生成中…" if self.generating else "换一题",
-                  "restart": "重新开始", "fit": "全景"}
+                  "restart": "重新开始", "fit": "全景", "home": "返回首页",
+                  "next": "重新挑战" if self.current_level == LEVEL_COUNT - 1
+                          and self.campaign.all_completed else "下一关"}
         for key, rect in self.buttons.items():
             enabled = not ((key == "new" and (self.config is None or self.generating))
-                           or (key == "restart" and self.session is None))
-            pygame.draw.rect(screen, BUTTON if enabled else (39, 43, 52), rect, border_radius=8)
-            pygame.draw.rect(screen, (82, 133, 126) if enabled else GRID_DISABLED,
-                             rect, width=1, border_radius=8)
-            self.draw_fitted(labels[key], rect.inflate(-12, -8),
-                             TEXT if enabled else MUTED, centered=True)
+                           or (key == "restart" and self.session is None)
+                           or (key == "next" and not self.can_advance()))
+            self.draw_button(rect, labels[key], enabled)
+        if self.failure_visible:
+            self.draw_failure()
 
     def close(self):
         self.cancel_generation()
+        self.admin_input = ""
+        pygame.key.stop_text_input()
         self.running = False
 
 
@@ -364,34 +648,19 @@ GRID_DISABLED = (75, 80, 90)
 
 
 def parse_args():
-    # 命令行参数或 JSON 二选一创建关卡来源，错误配置在启动窗口前报告。
-    parser = argparse.ArgumentParser(description="可配置的箭头消除游戏")
-    parser.add_argument("--level", type=Path, help="随机配置或手工布局 JSON")
+    parser = argparse.ArgumentParser(description="五关箭头消除游戏；关卡参数在 config/campaign.json 中设置")
     parser.add_argument("--seed", type=int, help="复现同一系列随机题")
-    for name in ("rows", "cols", "arrow-count", "min-length", "max-length"):
-        parser.add_argument("--" + name, type=int)
-    parser.add_argument("--turn-probability", type=float)
-    args = parser.parse_args()
-    overrides = {name: getattr(args, name) for name in
-                 ("rows", "cols", "arrow_count", "min_length", "max_length", "turn_probability")
-                 if getattr(args, name) is not None}
-    if args.level is not None and overrides:
-        parser.error("--level 与行列/形状参数不能同时使用")
-    try:
-        source = load_level(args.level) if args.level is not None else LevelConfig(**overrides)
-    except (ValueError, TypeError, KeyError, OSError) as exc:
-        parser.error(str(exc))
-    return args, source
+    return parser.parse_args()
 
 
 def main():
     # 初始化窗口并进入事件、状态更新、绘制的逐帧循环。
-    args, source = parse_args()
+    args = parse_args()
     pygame.init()
     pygame.key.set_repeat(250, 40)
     pygame.display.set_caption("一箭又一箭")
     screen = pygame.display.set_mode((960, 640), pygame.RESIZABLE)
-    app = GameApp(screen, source, seed=args.seed)
+    app = GameApp(screen, seed=args.seed)
     clock = pygame.time.Clock()
     try:
         while app.running:
