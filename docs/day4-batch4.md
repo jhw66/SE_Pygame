@@ -117,7 +117,7 @@ if restarted_this_frame or game_state != PLAYING or flying_arrow is not None:
 
 ## 8. 本批验证
 
-2026-09-17，Codex 运行 test_logic.py 和 test_interaction.py，原有全部检查通过。
+以下为 2026-09-17 的历史验证记录，当时的规则与交互检查全部通过；相关测试脚本现已移除。
 新增 7 组重开检查通过：
 
 1. 消除并失误后恢复，同时验证初始布局未被修改、内部行列表没有共享。

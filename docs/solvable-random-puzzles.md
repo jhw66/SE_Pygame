@@ -16,7 +16,7 @@
 这不是玩家选错了消除顺序。基础规则下，消除只会减少阻挡，不会制造新的阻挡。
 
 此前测试覆盖了单个箭头的检测、动画、失败和重开，但没有检验整盘能否清空。
-本次补齐这个遗漏，并将旧棋盘保留在交互测试中作为固定测试夹具和已知无解案例。
+当时补齐了这个遗漏，并用旧棋盘作为已知无解案例进行检查；相关测试脚本现已移除。
 实际游戏不再使用旧布局。
 
 ## 2. 两个按钮各自做什么
@@ -85,11 +85,11 @@ direction = rng.choice(unused_directions or list(DIRECTIONS))
 
 ## 6. 通关发生在动画结束以后
 
-main.py 在最后一个箭头完全离开、对应格子清空后检查：
+最后一个箭头完全离开、对应格子清空后才检查通关。当前实现位于 game_state.py：
 
 ```python
-if count_arrows(board) == 0:
-    game_state = WON
+if not self.board.arrows:
+    self.state = WON
 ```
 
 WON 状态显示绿色通关标题，屏蔽棋盘点击，但允许重开与换题。
@@ -98,13 +98,7 @@ WON 状态显示绿色通关标题，屏蔽棋盘点击，但允许重开与换�
 
 ## 7. 已做的验证与边界
 
-2026-09-17，执行以下命令均成功：
-
-```powershell
-.\.venv\Scripts\python.exe -X utf8 test_logic.py
-.\.venv\Scripts\python.exe -X utf8 test_interaction.py
-.\.venv\Scripts\python.exe -X utf8 test_puzzles.py
-```
+以下为 2026-09-17 的历史验证记录；相关测试脚本现已移除，不再提供运行命令。
 
 - 原有交互测试使用明确的固定夹具，避免随机题使指定坐标案例失去含义。
 - 新测试调用真实生成器，1000 个种子都产生可解题，共得到 1000 个不同布局。

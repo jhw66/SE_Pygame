@@ -1,16 +1,14 @@
-"""Pygame 入口：关卡配置、窗口事件和异步生成。导入不会启动游戏。"""
+"""Pygame 入口：关卡配置、窗口事件和异步生成"""
 import argparse
 from pathlib import Path
 import queue
 import random
 import threading
-import time
 import pygame
 
 from board_view import BoardView, BACKGROUND, ARROW_COLOR, ERROR_COLOR
 from game_state import GameSession, FAILED, WON
-from levels import (GenerationCancelled, GenerationError, LevelConfig,
-                    generate_level, level_metrics, load_level)
+from levels import LevelConfig, generate_level, load_level
 
 TEXT = (235, 240, 250)
 MUTED = (170, 180, 200)
@@ -19,15 +17,13 @@ BUTTON = (55, 75, 90)
 
 # 应用层连接窗口、游戏状态、棋盘视图和后台关卡任务。
 class GameApp:
-    def __init__(self, screen, config=None, board=None, seed=None, level_factory=None):
+    def __init__(self, screen, source, seed=None):
         self.screen = screen
-        self.config = config if config is not None or board is not None else LevelConfig()
-        self.level_factory = level_factory or generate_level
-        # 允许测试替换生成函数，复现生成失败、取消与延迟返回等情况。
+        # 关卡来源只有一种：随机配置，或已加载的手工棋盘。
+        self.config = source if isinstance(source, LevelConfig) else None
         self.rng = random.Random(seed)
         self.color_rng = random.Random(seed)  # 配色不消耗关卡生成的随机数序列
         self.session = None
-        self.metrics = None
         self.running = True
         self.generating = False
         self.notice = ""
@@ -37,18 +33,16 @@ class GameApp:
         # 队列传递后台结果；任务编号用于识别已取消的旧结果。
         self.job_id = 0
         self.cancel_event = None
-        self.worker = None
         font_path = pygame.font.match_font(["microsoftyahei", "simhei", "simsun"])
         self.font = pygame.font.Font(font_path, 20)
         self.small_font = pygame.font.Font(font_path, 17)
         self.compact_font = pygame.font.Font(font_path, 14)
-        rows = board.rows if board is not None else self.config.rows
-        cols = board.cols if board is not None else self.config.cols
+        rows, cols = source.rows, source.cols
         self.view = BoardView(self.layout_ui(rows, cols), rows, cols)
-        if board is not None:
-            self.install(board)
-        else:
+        if self.config is not None:
             self.request_new()
+        else:
+            self.install(source)
 
     def layout_ui(self, rows, cols):
         """棋盘在整窗居中；控件使用自然留白，不覆盖任何可玩格子。"""
@@ -90,7 +84,7 @@ class GameApp:
                                            min(110, h - area.bottom - 15))
         return area
 
-    def install(self, board, metrics=None):
+    def install(self, board):
         # 新题统一加载布局、全景和配色，同时清理未结束的鼠标手势。
         if self.session is None:
             self.session = GameSession(board)
@@ -99,7 +93,6 @@ class GameApp:
         self.view.rect = self.layout_ui(board.rows, board.cols)
         self.view.set_board(board.rows, board.cols)
         self.view.assign_colors(board, self.color_rng)
-        self.metrics = level_metrics(board) if metrics is None else metrics
         self.notice = ""
         self.cancel_pointer()
 
@@ -136,25 +129,15 @@ class GameApp:
 
         def work():
             # 后台只做数据计算，通过线程安全队列返回，不操作 Pygame 窗口。
-            deadline = time.monotonic() + 5.0
-
-            def checkpoint():
-                if cancel.is_set():
-                    raise GenerationCancelled("已取消生成")
-                if time.monotonic() >= deadline:
-                    raise GenerationError("生成超时，请调整关卡配置")
-
             try:
-                board = self.level_factory(self.config, previous=previous, rng=rng, cancel_event=cancel)
-                checkpoint()
-                metrics = level_metrics(board, checkpoint)
-                self.results.put((token, board, metrics, None))
+                # 时间预算与取消检查统一由生成器负责。
+                board = generate_level(self.config, previous=previous, rng=rng, cancel_event=cancel)
+                self.results.put((token, board, None))
             except Exception as exc:
-                self.results.put((token, None, None, str(exc)))
+                self.results.put((token, None, str(exc)))
 
-        self.worker = threading.Thread(target=work, daemon=True)
         # 启动后台任务后立刻返回，主循环继续处理关闭、缩放与绘制。
-        self.worker.start()
+        threading.Thread(target=work, daemon=True).start()
 
     def restart(self):
         # 恢复同一道题，不重置视图和颜色，也不消耗关卡随机数。
@@ -168,7 +151,7 @@ class GameApp:
         # 主线程领取结果；旧任务即使晚到，也不能覆盖重开或新题
         while True:
             try:
-                token, board, metrics, error = self.results.get_nowait()
+                token, board, error = self.results.get_nowait()
             except queue.Empty:
                 break
             if token != self.job_id:
@@ -177,7 +160,7 @@ class GameApp:
             if error is not None:
                 self.notice = "生成失败：" + error
             else:
-                self.install(board, metrics)
+                self.install(board)
         if self.session is not None and not self.generating:
             self.session.update(dt)
 
@@ -196,13 +179,13 @@ class GameApp:
                 self.view.resize(self.layout_ui(self.view.rows, self.view.cols))
             elif event.type == pygame.MOUSEWHEEL:
                 # 普通滚轮缩放，Shift 加滚轮或横向滚轮负责左右平移。
-                pos = getattr(event, "pos", pygame.mouse.get_pos())
+                pos = pygame.mouse.get_pos()
                 if not self.view.rect.collidepoint(pos):
                     continue
                 self.left_press = None
                 dx = getattr(event, "precise_x", getattr(event, "x", 0))
                 dy = getattr(event, "precise_y", getattr(event, "y", 0))
-                mods = getattr(event, "mod", pygame.key.get_mods())
+                mods = pygame.key.get_mods()
                 step = self.view.cell_size * 2
                 if dx:
                     # 触控板或横向滚轮：向右滚动时，棋盘内容向左移动。
@@ -380,7 +363,7 @@ class GameApp:
 GRID_DISABLED = (75, 80, 90)
 
 
-def parse_args(argv=None):
+def parse_args():
     # 命令行参数或 JSON 二选一创建关卡来源，错误配置在启动窗口前报告。
     parser = argparse.ArgumentParser(description="可配置的箭头消除游戏")
     parser.add_argument("--level", type=Path, help="随机配置或手工布局 JSON")
@@ -388,7 +371,7 @@ def parse_args(argv=None):
     for name in ("rows", "cols", "arrow-count", "min-length", "max-length"):
         parser.add_argument("--" + name, type=int)
     parser.add_argument("--turn-probability", type=float)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     overrides = {name: getattr(args, name) for name in
                  ("rows", "cols", "arrow_count", "min_length", "max_length", "turn_probability")
                  if getattr(args, name) is not None}
@@ -401,17 +384,14 @@ def parse_args(argv=None):
     return args, source
 
 
-def main(argv=None):
+def main():
     # 初始化窗口并进入事件、状态更新、绘制的逐帧循环。
-    args, source = parse_args(argv)
+    args, source = parse_args()
     pygame.init()
     pygame.key.set_repeat(250, 40)
     pygame.display.set_caption("一箭又一箭")
     screen = pygame.display.set_mode((960, 640), pygame.RESIZABLE)
-    if isinstance(source, LevelConfig):
-        app = GameApp(screen, config=source, seed=args.seed)
-    else:
-        app = GameApp(screen, board=source, seed=args.seed)
+    app = GameApp(screen, source, seed=args.seed)
     clock = pygame.time.Clock()
     try:
         while app.running:
@@ -429,5 +409,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    # 直接运行才启动游戏；测试导入 main 时不会弹窗。
+    # 直接运行才启动游戏；作为模块导入时不会弹窗。
     main()

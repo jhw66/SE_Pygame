@@ -102,12 +102,7 @@ return arrow["x"] - ARROW_EXTENT >= board_rect.right
 
 ## 8. 已进行的验证
 
-2026-09-16，Codex 在本地运行：
-
-```powershell
-.\.venv\Scripts\python.exe -X utf8 test_logic.py
-.\.venv\Scripts\python.exe -X utf8 test_interaction.py
-```
+以下为 2026-09-16 的历史验证记录；相关测试脚本现已移除，不再提供运行命令。
 
 - 原有 29 个路径案例、4 个数量案例、12 个交互场景通过。
 - 新增 5 组检查通过：中途保留数据并能关闭；同帧与跨帧连点保护；四方向完成；
