@@ -1,6 +1,6 @@
 """游戏状态和动画计时"""
 from dataclasses import dataclass
-from game_logic import MovementPlan, plan_movement
+from game_logic import MovementPlan, plan_movement, positive_integer
 
 PLAYING, FAILED, WON = "playing", "failed", "won"
 BASE_MOVE_SPEED = 4.0  # 小棋盘的基础速度，单位格/秒
@@ -25,7 +25,9 @@ class Motion:
 
 # 管理一局游戏的规则状态，时间推进不依赖 Pygame 窗口
 class GameSession:
-    def __init__(self, board):
+    def __init__(self, board, max_lives=MAX_MISTAKES):
+        positive_integer(max_lives, "生命值")
+        self.max_lives = max_lives
         self.load(board)
 
     # 保存原始布局快照，供重玩同一题使用
@@ -37,7 +39,7 @@ class GameSession:
     def restart(self):
         self.board = self.initial.copy()
         self.state = PLAYING if self.board.arrows else WON
-        self.mistakes_remaining = MAX_MISTAKES
+        self.mistakes_remaining = self.max_lives
         self.motion = None
 
     # 只在可操作且没有动画时接受头部点击，身体与空格直接忽略
@@ -92,7 +94,7 @@ class GameSession:
                     break
                 motion.phase = "return"
             else:
-                # 减小路程直到回原位，第三次碰撞也要返回结束才失败。
+                # 减小路程直到回原位，最后一次碰撞也继续播放返回动画。
                 needed = motion.progress / motion.speed
                 elapsed = min(dt, needed)
                 motion.progress = max(0.0, motion.progress - elapsed * motion.speed)

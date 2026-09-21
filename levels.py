@@ -1,20 +1,18 @@
-"""可配置的随机关卡、手工 JSON 关卡和设计指标"""
+"""五关所用的随机布局配置与可解生成器"""
 from dataclasses import dataclass
-import json
 import math
-from pathlib import Path
 import random
 import time
 
-from game_logic import Arrow, BoardState, DIRECTIONS, can_exit, positive_integer, solve_board
+from game_logic import Arrow, BoardState, DIRECTIONS, positive_integer, solve_board
 
 
-# 关卡设计参数集中管理，默认值不代表棋盘尺寸的规则限制。
+# 行列数与支数由五关 JSON 配置提供。
 @dataclass(frozen=True)
 class LevelConfig:
-    rows: int = 5
-    cols: int = 5
-    arrow_count: int = 13
+    rows: int
+    cols: int
+    arrow_count: int
     min_length: int = 1
     max_length: int = 1
     turn_probability: float = 0.0
@@ -73,7 +71,7 @@ def _singletons(config, rng, checkpoint):
                 candidates.append((r, c))
         cell = rng.choice(candidates)
         arrow_id = len(result)
-        result[arrow_id] = Arrow(arrow_id, (cell), direction)
+        result[arrow_id] = Arrow(arrow_id, (cell,), direction)
         # 构造时的虚拟移除顺序，本身就是最终布局的一条解
         # 第一支箭头时，后面所有箭头的位置都已经被检查过了；
         # 如果它们会挡住第一支，这个方向就无法通过检查；所以说从本质上构成了防止死锁的前提
@@ -124,9 +122,8 @@ def _grow(board, arrow_id, probability, rng, checkpoint):
     return False
 
 # 先满足最小长度，再尝试增加长度，只返回满足配置且已验解的布局；失败不修改 previous
-def generate_level(config=None, previous=None, rng=None, *, max_attempts=100, time_budget=5.0, cancel_event=None):
+def generate_level(config, previous=None, rng=None, *, max_attempts=100, time_budget=5.0, cancel_event=None):
     # 检查参数、设置预算
-    config = config or LevelConfig()
     positive_integer(max_attempts, "尝试次数")
     if not math.isfinite(time_budget) or time_budget <= 0:
         raise ValueError("生成时间预算必须大于零")
@@ -172,56 +169,3 @@ def generate_level(config=None, previous=None, rng=None, *, max_attempts=100, ti
             checkpoint()
             return board
     raise GenerationError("已达到生成尝试上限，请调整尺寸、支数或长度范围")
-
-# 没有 arrows 字段时读取随机配置；有具体箭头时创建手工棋盘并验解
-def load_level(path):
-    # Path 负责路径和文件读取
-    # json.loads() 将 JSON 文本解析成 Python 对象
-    # utf-8-sig 同时兼容普通 UTF-8 和带 BOM 的 UTF-8 文件
-    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    if not isinstance(data, dict):
-        raise ValueError("关卡文件必须是 JSON 对象")
-    
-    # 没有具体箭头时返回随机配置，有具体箭头时按手工布局加载。
-    if "arrows" not in data:
-        return LevelConfig(**data)   # **data 是字典解包；{"rows": 7, "cols": 10} -> LevelConfig(rows=7, cols=10)
-    if set(data) != {"rows", "cols", "arrows"}:
-        raise ValueError("手工关卡只包含 rows、cols、arrows")
-    arrows = {}
-    for item in data["arrows"]:
-        arrow = Arrow(**item)
-        if arrow.id in arrows:
-            raise ValueError("手工关卡箭头编号重复")
-        arrows[arrow.id] = arrow
-    board = BoardState(data["rows"], data["cols"], arrows)
-    if solve_board(board) is None:
-        raise ValueError("手工关卡无法完整消除，请调整路径或方向")
-    return board
-
-# 统计占用率、开局可消除支数和解除阻挡的轮数
-def level_metrics(board):
-    working = board.copy()
-    first_choices = 0
-    rounds = 0
-    while working.arrows:
-        # 先收集一整轮可消除对象再统一删除，用于统计解除阻挡的轮数。
-        removable = []
-        for arrow_id in working.arrows:
-            if can_exit(working, arrow_id):
-                removable.append(arrow_id)
-        if rounds == 0:
-            first_choices = len(removable)
-        if not removable:
-            rounds = None
-            break
-        for arrow_id in removable:
-            working.remove(arrow_id)
-        rounds += 1
-    return {
-        # 所有箭头占用格数 ÷ 棋盘总格数
-        "occupancy_ratio": sum(len(a.cells) for a in board.arrows.values()) / (board.rows * board.cols),
-        # 初始状态能够直接退出的箭头支数
-        "initial_choices": first_choices,
-        # 每轮同时移除当前全部可退出箭头，需要多少轮清空
-        "unlock_rounds": rounds,                                                                         
-    }

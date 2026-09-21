@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 learning-note/
+/admin.json
+/config/admin.json
+/config/campaign.json
