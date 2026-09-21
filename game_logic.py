@@ -1,4 +1,4 @@
-"""纯数据规则：路径按尾到头排列，距离单位为格，不依赖 Pygame。"""
+"""纯数据规则：路径按尾到头排列，距离单位为格"""
 from dataclasses import dataclass, field
 
 Cell = tuple[int, int]
@@ -47,7 +47,7 @@ class Arrow:
         return self.cells[-1]
 
 
-# 箭头字典保存完整对象，占用表负责快速查询每格属于谁。
+# 箭头字典保存完整对象，占用表负责快速查询每格属于谁
 @dataclass
 class BoardState:
     rows: int
@@ -102,9 +102,9 @@ class BoardState:
         if arrow_id is not None and self.arrows[arrow_id].head == cell:
             return arrow_id
         return None
-
+    
     def signature(self):
-        """比较布局时忽略编号，避免只重编号也被当成换题。"""
+        # 比较布局时忽略编号，避免只重编号也被当成换题
         return self.rows, self.cols, tuple(sorted((a.cells, a.direction) for a in self.arrows.values()))
 
 
@@ -141,9 +141,6 @@ def plan_movement(board, arrow_id):
 def can_exit(board, arrow_id):
     return arrow_id in board.arrows and plan_movement(board, arrow_id).outcome == "exit"
 
-
-def count_arrows(board):
-    return len(board.arrows)
 
 # 移除只会减少阻挡，因此可逐轮贪心求解；不修改输入
 def solve_board(board, checkpoint=None):
@@ -191,16 +188,3 @@ def moving_shape(arrow, progress=0.0):
     end = len(arrow.cells) - 1 + progress + 0.12
     distances = [start] + [i for i in range(len(arrow.cells)) if start < i < end] + [end]
     return [path_point(arrow, s) for s in distances], path_point(arrow, len(arrow.cells) - 1 + progress)
-
-
-def from_legacy_grid(grid):
-    """迁移旧单格布局，也用于历史规则测试。"""
-    if not grid or not grid[0] or any(len(row) != len(grid[0]) for row in grid):
-        raise ValueError("旧棋盘必须是非空矩形")
-    arrows = {}
-    for r, row in enumerate(grid):
-        for c, direction in enumerate(row):
-            if direction is not None:
-                arrow_id = len(arrows)
-                arrows[arrow_id] = Arrow(arrow_id, ((r, c),), direction)
-    return BoardState(len(grid), len(grid[0]), arrows)

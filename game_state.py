@@ -1,4 +1,4 @@
-"""游戏状态和动画计时：不依赖窗口，便于确定性测试。"""
+"""游戏状态和动画计时"""
 from dataclasses import dataclass
 from game_logic import MovementPlan, plan_movement
 
@@ -39,7 +39,6 @@ class GameSession:
         self.state = PLAYING if self.board.arrows else WON
         self.mistakes_remaining = MAX_MISTAKES
         self.motion = None
-        self.status = "点击头部所在格；身体点击无效"
 
     # 只在可操作且没有动画时接受头部点击，身体与空格直接忽略
     def click(self, cell):
@@ -54,9 +53,9 @@ class GameSession:
         travel_budget = (MAX_ACTION_DURATION if plan.outcome == "exit"
                          else (MAX_ACTION_DURATION - COLLISION_PAUSE) / 2)
         self.motion = Motion(plan, max(scaled_speed, plan.distance / travel_budget))
-        self.status = "箭头正在前进"
         return True
 
+    # 修改motion.progress即已经运动距离
     def update(self, dt):
         if dt < 0:
             raise ValueError("时间增量不能为负数")
@@ -78,15 +77,12 @@ class GameSession:
                     # 完整离场才提交删除；最后一支删除后才通关。
                     self.board.remove(motion.plan.arrow_id)
                     self.motion = None
-                    self.status = "箭头已消除"
                     if not self.board.arrows:
                         self.state = WON
-                        self.status = "本题通关！可以重玩，或换一题"
                 else:
                     # 只在首次接触障碍、切入停顿阶段时扣一次机会。
                     motion.phase = "pause"
                     self.mistakes_remaining -= 1
-                    self.status = "发生碰撞，机会减 1，正在返回"
             elif motion.phase == "pause":
                 # 碰撞变红后短暂停顿，再反向播放同一条轨迹。
                 elapsed = min(dt, motion.pause_remaining)
@@ -106,6 +102,3 @@ class GameSession:
                 self.motion = None
                 if self.mistakes_remaining == 0:
                     self.state = FAILED
-                    self.status = "失误机会已用尽，本关失败"
-                else:
-                    self.status = "已回到原位，请选择其他箭头"
